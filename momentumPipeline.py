@@ -1,0 +1,1263 @@
+import csv
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.lines import Line2D
+from matplotlib.widgets import Button, RadioButtons, Slider, TextBox
+
+from imageProcessing import ImageProcessing
+from runParameters import RunParameters
+
+
+@dataclass(frozen=True)
+class ParameterGroup:
+    params: Tuple[Tuple[str, Any], ...]
+    run_numbers: Tuple[int, ...]
+
+    def as_dict(self) -> Dict[str, Any]:
+        return dict(self.params)
+
+    @property
+    def key(self) -> str:
+        parts = []
+        for name, value in self.params:
+            safe_value = str(value).replace("/", "_").replace(" ", "")
+            parts.append(f"{name}={safe_value}")
+        return "__".join(parts)
+
+
+@dataclass
+class AveragedProfile:
+    group: ParameterGroup
+    run_numbers: List[int]
+    k: np.ndarray
+    nk: np.ndarray
+    stderr: np.ndarray
+    n_shots_per_point: np.ndarray
+    scale_factor: float = 1.0
+
+
+def _to_python_scalar(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _ensure_numeric_array(val: Any) -> np.ndarray:
+    """Ensure val is a 1D numpy array of floats.
+
+    Accepts:
+    - bytes or str containing comma-separated numbers
+    - numpy scalar or ndarray (numeric or string)
+    - python lists/tuples
+    """
+    # bytes/str scalar with commas
+    if isinstance(val, (bytes, str)):
+        s = val.decode() if isinstance(val, bytes) else val
+        parts = [p for p in s.split(',') if p.strip() != '']
+        return np.asarray([float(p) for p in parts], dtype=float)
+
+    # python list/tuple
+    if isinstance(val, (list, tuple)):
+        return np.asarray(val, dtype=float)
+
+    # numpy array or scalar
+    if isinstance(val, np.ndarray):
+        # numeric array
+        if np.issubdtype(val.dtype, np.number):
+            return val.astype(float)
+        # object or string array: try astype(float) first
+        try:
+            return val.astype(float)
+        except Exception:
+            # try joining and splitting
+            try:
+                joined = ','.join([x.decode() if isinstance(x, bytes) else str(x) for x in val.flat])
+                parts = [p for p in joined.split(',') if p.strip() != '']
+                return np.asarray([float(p) for p in parts], dtype=float)
+            except Exception:
+                pass
+        # 0-d array containing string
+        if val.ndim == 0:
+            return _ensure_numeric_array(val.item())
+
+    # numpy scalar
+    if isinstance(val, (np.floating, np.integer)):
+        return np.asarray([float(val)], dtype=float)
+
+    # fallback try
+    try:
+        return np.asarray(val, dtype=float)
+    except Exception as e:
+        raise ValueError(f"Cannot parse numeric array from value: {val!r}") from e
+
+
+def group_run_numbers(
+    run_parameters: RunParameters,
+    run_numbers: Sequence[int],
+    sort_parameter: Optional[str] = None,
+) -> List[ParameterGroup]:
+    grouped: Dict[Tuple[Tuple[str, Any], ...], List[int]] = {}
+    ordered_names = list(run_parameters.variable_names)
+
+    for run_number in run_numbers:
+        params = run_parameters[run_number]
+        key = tuple((name, _to_python_scalar(params[name])) for name in ordered_names)
+        grouped.setdefault(key, []).append(run_number)
+
+    groups: List[ParameterGroup] = [
+        ParameterGroup(params=key, run_numbers=tuple(sorted(group_runs)))
+        for key, group_runs in grouped.items()
+    ]
+
+    if sort_parameter is None:
+        groups.sort(key=lambda g: tuple(v for _, v in g.params))
+    else:
+        groups.sort(
+            key=lambda g: (
+                g.as_dict().get(sort_parameter, 0),
+                tuple(v for _, v in g.params),
+            )
+        )
+
+    return groups
+
+
+def _interp_to_reference_grid(
+    reference_k: np.ndarray,
+    shot_k: np.ndarray,
+    shot_nk: np.ndarray,
+) -> np.ndarray:
+    sort_idx = np.argsort(shot_k)
+    k_sorted = np.asarray(shot_k)[sort_idx]
+    nk_sorted = np.asarray(shot_nk)[sort_idx]
+
+    unique_k, unique_indices = np.unique(k_sorted, return_index=True)
+    unique_nk = nk_sorted[unique_indices]
+
+    if unique_k.size < 2:
+        return np.full_like(reference_k, np.nan, dtype=float)
+
+    interpolated = np.interp(reference_k, unique_k, unique_nk, left=np.nan, right=np.nan)
+    outside = (reference_k < unique_k[0]) | (reference_k > unique_k[-1])
+    interpolated[outside] = np.nan
+    return interpolated
+
+
+def average_profiles(
+    profiles: Sequence[Tuple[np.ndarray, np.ndarray]],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if not profiles:
+        raise ValueError("Cannot average an empty list of profiles.")
+
+    ref_index = int(np.argmax([len(k_vals) for k_vals, _ in profiles]))
+    reference_k = np.asarray(profiles[ref_index][0], dtype=float)
+    matrix = np.full((len(profiles), len(reference_k)), np.nan, dtype=float)
+
+    for idx, (k_vals, nk_vals) in enumerate(profiles):
+        matrix[idx, :] = _interp_to_reference_grid(
+            reference_k,
+            np.asarray(k_vals, dtype=float),
+            np.asarray(nk_vals, dtype=float),
+        )
+
+    counts = np.sum(np.isfinite(matrix), axis=0)
+    means = np.nanmean(matrix, axis=0)
+
+    stderr = np.zeros_like(means)
+    valid_for_stderr = counts > 1
+    if np.any(valid_for_stderr):
+        stderr[valid_for_stderr] = (
+            np.nanstd(matrix[:, valid_for_stderr], axis=0, ddof=1)
+            / np.sqrt(counts[valid_for_stderr])
+        )
+
+    valid = counts > 0
+    return reference_k[valid], means[valid], stderr[valid], counts[valid]
+
+
+def _write_profile_csv(
+    filepath: Path,
+    k: np.ndarray,
+    nk: np.ndarray,
+    stderr: np.ndarray,
+    n_shots: np.ndarray,
+) -> None:
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    with filepath.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["k", "nk", "stderr", "n_shots"])
+        for row in zip(k, nk, stderr, n_shots):
+            writer.writerow(row)
+
+
+class BadImageSelectionGUI:
+    def __init__(
+        self,
+        image_processing: ImageProcessing,
+        groups: Sequence[ParameterGroup],
+        output_dir: Path,
+    ):
+        self.image_processing = image_processing
+        self.groups = list(groups)
+        self.output_dir = output_dir
+
+        self.group_idx = 0
+        self.manual_blanks: set[int] = set()
+        self.sigma_thresholds: Dict[str, Tuple[float, float]] = {
+            group.key: (3.0, 3.0) for group in self.groups
+        }
+        self.sigma_blanks_by_group: Dict[str, set[int]] = {group.key: set() for group in self.groups}
+        self.artist_to_inum: Dict[Any, int] = {}
+
+        self.fig, self.axes = plt.subplots(1, 3, figsize=(16, 6))
+        self.fig.subplots_adjust(bottom=0.28, wspace=0.3)
+        self.ax_profiles, self.ax_n, self.ax_energy = self.axes
+
+        self.low_sigma_slider = Slider(
+            self.fig.add_axes([0.16, 0.19, 0.32, 0.03]),
+            "Lower sigma",
+            0.0,
+            6.0,
+            valinit=3.0,
+            valstep=0.1,
+        )
+        self.high_sigma_slider = Slider(
+            self.fig.add_axes([0.16, 0.13, 0.32, 0.03]),
+            "Upper sigma",
+            0.0,
+            6.0,
+            valinit=3.0,
+            valstep=0.1,
+        )
+
+        self.btn_prev = Button(self.fig.add_axes([0.52, 0.16, 0.08, 0.06]), "Prev")
+        self.btn_next = Button(self.fig.add_axes([0.61, 0.16, 0.08, 0.06]), "Next")
+        self.btn_reset_group = Button(self.fig.add_axes([0.70, 0.16, 0.12, 0.06]), "Reset group")
+        self.btn_reset_all = Button(self.fig.add_axes([0.83, 0.16, 0.12, 0.06]), "Reset all")
+        self.btn_save = Button(self.fig.add_axes([0.70, 0.08, 0.25, 0.06]), "Save and close")
+
+        self.low_sigma_slider.on_changed(self._on_sigma_changed)
+        self.high_sigma_slider.on_changed(self._on_sigma_changed)
+        self.btn_prev.on_clicked(self._prev_group)
+        self.btn_next.on_clicked(self._next_group)
+        self.btn_reset_group.on_clicked(self._reset_group)
+        self.btn_reset_all.on_clicked(self._reset_all)
+        self.btn_save.on_clicked(self._save_and_close)
+        self.fig.canvas.mpl_connect("pick_event", self._on_pick)
+
+        self._refresh_plot()
+
+    def _current_group(self) -> ParameterGroup:
+        return self.groups[self.group_idx]
+
+    def _effective_blanks(self) -> List[int]:
+        auto_blanks = set().union(*self.sigma_blanks_by_group.values())
+        return sorted(self.manual_blanks | auto_blanks)
+
+    def _calc_sigma_blanks(self, group: ParameterGroup, low_sigma: float, high_sigma: float) -> set[int]:
+        n_values: List[float] = []
+        e_values: List[float] = []
+        run_numbers = list(group.run_numbers)
+        for inum in run_numbers:
+            calc = self.image_processing[inum]["calc"]
+            n_values.append(float(calc["N"]))
+            e_values.append(float(calc["Energy"]))
+
+        n_arr = np.array(n_values, dtype=float)
+        e_arr = np.array(e_values, dtype=float)
+
+        blanks = set()
+        for values in (n_arr, e_arr):
+            mean = float(np.mean(values))
+            std = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+            if std <= 0:
+                continue
+            lower = mean - low_sigma * std
+            upper = mean + high_sigma * std
+            for idx, value in enumerate(values):
+                if value < lower or value > upper:
+                    blanks.add(run_numbers[idx])
+        return blanks
+
+    def _refresh_plot(self) -> None:
+        group = self._current_group()
+        params = group.as_dict()
+        low_sigma, high_sigma = self.sigma_thresholds[group.key]
+        self.sigma_blanks_by_group[group.key] = self._calc_sigma_blanks(group, low_sigma, high_sigma)
+        group_blanks = self.sigma_blanks_by_group[group.key] | self.manual_blanks
+
+        self.artist_to_inum.clear()
+        for axis in self.axes:
+            axis.clear()
+
+        self.ax_profiles.set_title("Individual momentum distributions")
+        self.ax_profiles.set_xlabel("k")
+        self.ax_profiles.set_ylabel("nk")
+        self.ax_profiles.set_xscale("log")
+        self.ax_profiles.set_yscale("log")
+
+        self.ax_n.set_title("Atom number N")
+        self.ax_n.set_xlabel("Image number")
+        self.ax_n.set_ylabel("N")
+
+        self.ax_energy.set_title("Energy")
+        self.ax_energy.set_xlabel("Image number")
+        self.ax_energy.set_ylabel("Energy")
+
+        cmap = plt.cm.get_cmap("tab20", max(1, len(group.run_numbers)))
+        n_values = []
+        e_values = []
+        x_values = []
+
+        for idx, inum in enumerate(group.run_numbers):
+            color = cmap(idx)
+            data = self.image_processing[inum]
+            k_vals = _ensure_numeric_array(data["k"]) 
+            nk_vals = _ensure_numeric_array(data["nk"]) 
+            calc = data["calc"]
+            n_value = float(calc["N"])
+            e_value = float(calc["Energy"])
+
+            x_values.append(inum)
+            n_values.append(n_value)
+            e_values.append(e_value)
+
+            valid = np.isfinite(k_vals) & np.isfinite(nk_vals) & (k_vals > 0) & (nk_vals > 0)
+            alpha = 0.2 if inum in group_blanks else 0.9
+            profile_line, = self.ax_profiles.plot(
+                k_vals[valid],
+                nk_vals[valid],
+                color=color,
+                alpha=alpha,
+                picker=5,
+            )
+            n_point = self.ax_n.scatter([inum], [n_value], color=[color], alpha=alpha, picker=True, s=45)
+            e_point = self.ax_energy.scatter([inum], [e_value], color=[color], alpha=alpha, picker=True, s=45)
+            self.artist_to_inum[profile_line] = inum
+            self.artist_to_inum[n_point] = inum
+            self.artist_to_inum[e_point] = inum
+
+        self.ax_n.plot(x_values, n_values, color="0.6", alpha=0.4)
+        self.ax_energy.plot(x_values, e_values, color="0.6", alpha=0.4)
+
+        title = ", ".join(f"{k}={v}" for k, v in params.items())
+        self.fig.suptitle(
+            f"Group {self.group_idx + 1}/{len(self.groups)} | {title}\n"
+            f"Effective blanks in this group: {sum(i in group_blanks for i in group.run_numbers)}",
+            fontsize=11,
+        )
+        self.fig.canvas.draw_idle()
+
+    def _on_pick(self, event: Any) -> None:
+        artist = event.artist
+        inum = self.artist_to_inum.get(artist)
+        if inum is None and isinstance(artist, Line2D):
+            inum = self.artist_to_inum.get(artist)
+        if inum is None:
+            return
+        if inum in self.manual_blanks:
+            self.manual_blanks.remove(inum)
+        else:
+            self.manual_blanks.add(inum)
+        self._refresh_plot()
+
+    def _on_sigma_changed(self, _: float) -> None:
+        group = self._current_group()
+        self.sigma_thresholds[group.key] = (
+            float(self.low_sigma_slider.val),
+            float(self.high_sigma_slider.val),
+        )
+        self._refresh_plot()
+
+    def _prev_group(self, _: Any) -> None:
+        self.group_idx = (self.group_idx - 1) % len(self.groups)
+        self._sync_sliders_from_group()
+        self._refresh_plot()
+
+    def _next_group(self, _: Any) -> None:
+        self.group_idx = (self.group_idx + 1) % len(self.groups)
+        self._sync_sliders_from_group()
+        self._refresh_plot()
+
+    def _sync_sliders_from_group(self) -> None:
+        group = self._current_group()
+        low_sigma, high_sigma = self.sigma_thresholds[group.key]
+        self.low_sigma_slider.set_val(low_sigma)
+        self.high_sigma_slider.set_val(high_sigma)
+
+    def _reset_group(self, _: Any) -> None:
+        group = self._current_group()
+        for inum in group.run_numbers:
+            if inum in self.manual_blanks:
+                self.manual_blanks.remove(inum)
+        self.sigma_thresholds[group.key] = (3.0, 3.0)
+        self._sync_sliders_from_group()
+        self._refresh_plot()
+
+    def _reset_all(self, _: Any) -> None:
+        self.manual_blanks.clear()
+        self.sigma_thresholds = {group.key: (3.0, 3.0) for group in self.groups}
+        self.sigma_blanks_by_group = {group.key: set() for group in self.groups}
+        self._sync_sliders_from_group()
+        self._refresh_plot()
+
+    def save(self) -> Path:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        outpath = self.output_dir / "blanks.json"
+        payload = {
+            "blank_image_numbers": self._effective_blanks(),
+            "manual_blanks": sorted(self.manual_blanks),
+            "sigma_thresholds": {
+                key: {"lower_sigma": values[0], "upper_sigma": values[1]}
+                for key, values in self.sigma_thresholds.items()
+            },
+        }
+        outpath.write_text(json.dumps(payload, indent=2))
+        return outpath
+
+    def _save_and_close(self, _: Any) -> None:
+        self.save()
+        plt.close(self.fig)
+
+    def launch(self) -> List[int]:
+        plt.show()
+        self.save()
+        return self._effective_blanks()
+
+
+class DetuningRescaleGUI:
+    def __init__(
+        self,
+        averaged_profiles: Sequence[AveragedProfile],
+        detuning_parameter: str,
+        non_detuned_value: Any,
+        output_dir: Path,
+        sort_parameter: Optional[str] = None,
+    ):
+        self.detuning_parameter = detuning_parameter
+        self.non_detuned_value = non_detuned_value
+        self.output_dir = output_dir
+        self.all_profiles = list(averaged_profiles)
+        self.sort_parameter = sort_parameter
+
+        # map profile params -> profile for lookup
+        self.profile_map: Dict[Tuple[Tuple[str, Any], ...], AveragedProfile] = {
+            profile.group.params: profile for profile in self.all_profiles
+        }
+        # pairs: list of (detuned_profile, reference_profile)
+        self.pairs = self._build_pairs()
+        # confirmed scales keyed by detuning value (so one scale per detuning)
+        self.confirmed_scales: Dict[Any, float] = {}
+        # tentative scales set by Apply (not yet confirmed)
+        self.tentative_scales: Dict[Any, float] = {}
+        self.pair_idx = 0
+        self.current_scale = 1.0
+
+        self.fig, self.ax = plt.subplots(figsize=(10, 6))
+        self.fig.subplots_adjust(bottom=0.28)
+        self.ax.set_xscale("log")
+        self.ax.set_yscale("log")
+        self.ax.set_xlabel("k")
+        self.ax.set_ylabel("nk")
+
+        # scale input and control buttons
+        self.scale_box = TextBox(self.fig.add_axes([0.12, 0.12, 0.18, 0.05]), "Scale")
+        self.btn_apply = Button(self.fig.add_axes([0.31, 0.12, 0.09, 0.05]), "Apply")
+        self.btn_confirm = Button(self.fig.add_axes([0.41, 0.12, 0.09, 0.05]), "Confirm")
+        self.btn_prev = Button(self.fig.add_axes([0.52, 0.12, 0.08, 0.05]), "Prev")
+        self.btn_next = Button(self.fig.add_axes([0.61, 0.12, 0.08, 0.05]), "Next")
+        self.btn_save = Button(self.fig.add_axes([0.70, 0.12, 0.20, 0.05]), "Save and close")
+
+        # axis limit controls (user settable)
+        self.xmin_box = TextBox(self.fig.add_axes([0.12, 0.05, 0.12, 0.05]), "x min")
+        self.xmax_box = TextBox(self.fig.add_axes([0.25, 0.05, 0.12, 0.05]), "x max")
+        self.ymin_box = TextBox(self.fig.add_axes([0.38, 0.05, 0.12, 0.05]), "y min")
+        self.ymax_box = TextBox(self.fig.add_axes([0.51, 0.05, 0.12, 0.05]), "y max")
+        self.btn_apply_limits = Button(self.fig.add_axes([0.64, 0.05, 0.08, 0.05]), "Apply lims")
+        self.btn_reset_limits = Button(self.fig.add_axes([0.73, 0.05, 0.12, 0.05]), "Reset lims")
+
+        # callbacks
+        self.btn_apply.on_clicked(self._apply_scale)
+        self.btn_confirm.on_clicked(self._confirm_scale)
+        self.btn_prev.on_clicked(self._prev_pair)
+        self.btn_next.on_clicked(self._next_pair)
+        self.btn_save.on_clicked(self._save_and_close)
+        self.scale_box.on_submit(lambda txt: self._apply_scale(None))
+        self.btn_apply_limits.on_clicked(self._apply_limits)
+        self.btn_reset_limits.on_clicked(self._reset_limits)
+
+        # initialize default axis limits to None (auto)
+        self._default_xlim = None
+        self._default_ylim = None
+        # persistent user-specified limits (None means not set)
+        self.user_xlim: Optional[Tuple[float, float]] = None
+        self.user_ylim: Optional[Tuple[float, float]] = None
+
+        self._refresh_plot()
+
+    def _apply_limits(self, _: Any) -> None:
+        # parse boxes and store as persistent user limits, then refresh
+        try:
+            xmin = float(self.xmin_box.text.strip()) if self.xmin_box.text.strip() else None
+            xmax = float(self.xmax_box.text.strip()) if self.xmax_box.text.strip() else None
+            ymin = float(self.ymin_box.text.strip()) if self.ymin_box.text.strip() else None
+            ymax = float(self.ymax_box.text.strip()) if self.ymax_box.text.strip() else None
+            if xmin is not None and xmax is not None:
+                self.user_xlim = (xmin, xmax)
+            else:
+                self.user_xlim = None
+            if ymin is not None and ymax is not None:
+                self.user_ylim = (ymin, ymax)
+            else:
+                self.user_ylim = None
+        except Exception:
+            return
+        self._refresh_plot()
+
+    def _reset_limits(self, _: Any) -> None:
+        # clear text boxes and reset to defaults
+        try:
+            self.xmin_box.set_val("")
+            self.xmax_box.set_val("")
+            self.ymin_box.set_val("")
+            self.ymax_box.set_val("")
+        except Exception:
+            pass
+        # clear persistent user limits
+        self.user_xlim = None
+        self.user_ylim = None
+        if self._default_xlim and self._default_xlim[0] is not None:
+            self.ax.set_xlim(self._default_xlim)
+        if self._default_ylim and self._default_ylim[0] is not None:
+            self.ax.set_ylim(self._default_ylim)
+        self.fig.canvas.draw_idle()
+
+    def _build_pairs(self) -> List[Tuple[AveragedProfile, AveragedProfile]]:
+        pairs: List[Tuple[AveragedProfile, AveragedProfile]] = []
+        for profile in self.all_profiles:
+            params = profile.group.as_dict()
+            if params.get(self.detuning_parameter) == self.non_detuned_value:
+                continue
+
+            reference_params = []
+            for name, value in profile.group.params:
+                if name == self.detuning_parameter:
+                    reference_params.append((name, self.non_detuned_value))
+                else:
+                    reference_params.append((name, value))
+            reference_key = tuple(reference_params)
+            reference_profile = self.profile_map.get(reference_key)
+            if reference_profile is None:
+                continue
+            pairs.append((profile, reference_profile))
+
+        # Sort pairs by the requested sort_parameter (if provided) so user sees a sensible order
+        if self.sort_parameter is not None:
+            def sort_key(pair: Tuple[AveragedProfile, AveragedProfile]):
+                params = pair[0].group.as_dict()
+                return params.get(self.sort_parameter, 0)
+            pairs.sort(key=sort_key)
+        else:
+            pairs.sort(key=lambda pair: pair[0].group.key)
+        return pairs
+
+    def _estimate_initial_scale(
+        self,
+        detuned: AveragedProfile,
+        reference: AveragedProfile,
+    ) -> float:
+        # Estimate ratio detuned->reference on overlapping k points
+        det_on_ref = _interp_to_reference_grid(reference.k, detuned.k, detuned.nk)
+        valid = np.isfinite(det_on_ref) & (det_on_ref > 0) & np.isfinite(reference.nk) & (reference.nk > 0)
+        if np.sum(valid) < 3:
+            return 1.0
+        ratio = reference.nk[valid] / det_on_ref[valid]
+        ratio = ratio[np.isfinite(ratio) & (ratio > 0)]
+        if ratio.size == 0:
+            return 1.0
+        return float(np.median(ratio))
+
+    def _initial_scale_for_detuning(self, detuning_value: Any) -> float:
+        # compute initial median of estimated scales across all pairs with this detuning
+        estimates = []
+        for detuned, reference in self.pairs:
+            params = detuned.group.as_dict()
+            if params.get(self.detuning_parameter) != detuning_value:
+                continue
+            est = self._estimate_initial_scale(detuned, reference)
+            if np.isfinite(est) and est > 0:
+                estimates.append(est)
+        if not estimates:
+            return 1.0
+        return float(np.median(estimates))
+
+    def _current_pair(self) -> Tuple[AveragedProfile, AveragedProfile]:
+        return self.pairs[self.pair_idx]
+
+    def _refresh_plot(self) -> None:
+        self.ax.clear()
+        self.ax.set_xscale("log")
+        self.ax.set_yscale("log")
+        self.ax.set_xlabel("k")
+        self.ax.set_ylabel("nk")
+
+        if not self.pairs:
+            self.ax.text(0.5, 0.5, "No detuned/reference pairs found.", ha="center", va="center")
+            self.fig.canvas.draw_idle()
+            return
+
+        detuned, reference = self._current_pair()
+        detuning_value = detuned.group.as_dict().get(self.detuning_parameter)
+
+        # set current scale: prioritize tentative (Apply) then confirmed (Confirm) then initial estimate
+        if detuning_value in self.tentative_scales:
+            self.current_scale = self.tentative_scales[detuning_value]
+        elif detuning_value in self.confirmed_scales:
+            self.current_scale = self.confirmed_scales[detuning_value]
+        else:
+            self.current_scale = self._initial_scale_for_detuning(detuning_value)
+        self.scale_box.set_val(f"{self.current_scale:.6g}")
+
+        scaled_nk = detuned.nk * self.current_scale
+        scaled_err = detuned.stderr * self.current_scale
+
+        # set colors explicitly to avoid duplicate colors
+        ref_color = "tab:blue"
+        det_color = "tab:orange"
+        self.ax.loglog(reference.k, reference.nk, "o-", ms=3, label="Non-detuned reference", color=ref_color)
+        # fill reference errors if available
+        try:
+            if reference.stderr is not None and np.any(np.isfinite(reference.stderr)):
+                ref_err = reference.stderr
+                self.ax.fill_between(reference.k, reference.nk - ref_err, reference.nk + ref_err, color=ref_color, alpha=0.15)
+        except Exception:
+            pass
+        self.ax.loglog(detuned.k, scaled_nk, "o-", ms=3, label="Detuned (scaled)", color=det_color)
+        self.ax.fill_between(detuned.k, scaled_nk - scaled_err, scaled_nk + scaled_err, color=det_color, alpha=0.2)
+
+        # initialize default axis limits if not set
+        if self._default_xlim is None:
+            try:
+                xmin = min(np.nanmin(reference.k), np.nanmin(detuned.k))
+                xmax = max(np.nanmax(reference.k), np.nanmax(detuned.k))
+                self._default_xlim = (xmin, xmax)
+            except Exception:
+                self._default_xlim = (None, None)
+        if self._default_ylim is None:
+            try:
+                ymin = min(np.nanmin(reference.nk), np.nanmin(scaled_nk))
+                ymax = max(np.nanmax(reference.nk), np.nanmax(scaled_nk))
+                self._default_ylim = (ymin, ymax)
+            except Exception:
+                self._default_ylim = (None, None)
+
+        # apply any user-specified limits in text boxes if present
+        try:
+            xmin_txt = self.xmin_box.text.strip()
+            xmax_txt = self.xmax_box.text.strip()
+            if xmin_txt and xmax_txt:
+                self.ax.set_xlim(float(xmin_txt), float(xmax_txt))
+            else:
+                if self._default_xlim[0] is not None:
+                    self.ax.set_xlim(self._default_xlim)
+        except Exception:
+            pass
+        try:
+            ymin_txt = self.ymin_box.text.strip()
+            ymax_txt = self.ymax_box.text.strip()
+            if ymin_txt and ymax_txt:
+                self.ax.set_ylim(float(ymin_txt), float(ymax_txt))
+            else:
+                if self._default_ylim[0] is not None:
+                    self.ax.set_ylim(self._default_ylim)
+        except Exception:
+            pass
+
+        title = ", ".join(f"{k}={v}" for k, v in detuned.group.as_dict().items())
+        self.ax.set_title(f"Pair {self.pair_idx + 1}/{len(self.pairs)} | {title}")
+        self.ax.legend(loc="best")
+        self.fig.canvas.draw_idle()
+
+    def _apply_scale(self, _: Any) -> None:
+        if not self.pairs:
+            return
+        try:
+            text = self.scale_box.text.strip()
+            value = float(text)
+        except Exception:
+            return
+        if value <= 0:
+            raise ValueError("Scale factor must be positive.")
+        self.current_scale = value
+        # set tentative scale for this detuning (Apply only shows it; Confirm persists)
+        detuned, _ = self._current_pair()
+        detuning_value = detuned.group.as_dict().get(self.detuning_parameter)
+        self.tentative_scales[detuning_value] = self.current_scale
+        self._refresh_plot()
+
+    def _confirm_scale(self, _: Any) -> None:
+        if not self.pairs:
+            return
+        detuned, _ = self._current_pair()
+        detuning_value = detuned.group.as_dict().get(self.detuning_parameter)
+        # persist the tentative/current scale for this detuning value
+        if detuning_value in self.tentative_scales:
+            self.confirmed_scales[detuning_value] = self.tentative_scales[detuning_value]
+        else:
+            self.confirmed_scales[detuning_value] = self.current_scale
+        # advance to next pair
+        if self.pair_idx < len(self.pairs) - 1:
+            self.pair_idx += 1
+        self._refresh_plot()
+
+    def _prev_pair(self, _: Any) -> None:
+        if not self.pairs:
+            return
+        self.pair_idx = (self.pair_idx - 1) % len(self.pairs)
+        self._refresh_plot()
+
+    def _next_pair(self, _: Any) -> None:
+        if not self.pairs:
+            return
+        self.pair_idx = (self.pair_idx + 1) % len(self.pairs)
+        self._refresh_plot()
+
+    def _all_scale_factors(self) -> Dict[str, float]:
+        # Return a mapping group_key -> factor, applying the same factor to all groups
+        # that share the same detuning value. Prioritize tentative (Apply) then confirmed (Confirm)
+        factors: Dict[str, float] = {}
+        for profile in self.all_profiles:
+            params = profile.group.as_dict()
+            detuning_value = params.get(self.detuning_parameter)
+            # use tentative factor if present, otherwise confirmed, otherwise estimate
+            if detuning_value in self.tentative_scales:
+                factor = float(self.tentative_scales[detuning_value])
+            elif detuning_value in self.confirmed_scales:
+                factor = float(self.confirmed_scales[detuning_value])
+            else:
+                # find a reference pair for this profile to estimate scale
+                # fall back to 1.0
+                matching = [pair for pair in self.pairs if pair[0].group.as_dict().get(self.detuning_parameter) == detuning_value]
+                if matching:
+                    factor = float(self._estimate_initial_scale(matching[0][0], matching[0][1]))
+                else:
+                    factor = 1.0
+            factors[profile.group.key] = factor
+        return factors
+
+    def save(self) -> Tuple[Path, Dict[str, float]]:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        factors = self._all_scale_factors()
+        outpath = self.output_dir / "detuning_rescale_factors.json"
+        outpath.write_text(json.dumps(factors, indent=2))
+        return outpath, factors
+
+    def _save_and_close(self, _: Any) -> None:
+        self.save()
+        plt.close(self.fig)
+
+    def launch(self) -> Dict[str, float]:
+        plt.show()
+        _, factors = self.save()
+        return factors
+
+
+class PatchRangesGUI:
+    def __init__(
+        self,
+        patch_sets: Sequence[Tuple[Tuple[Tuple[str, Any], ...], List[AveragedProfile]]],
+        tof_parameter: str,
+        detuning_parameter: str,
+        output_dir: Path,
+    ):
+        self.patch_sets = list(patch_sets)
+        self.tof_parameter = tof_parameter
+        self.detuning_parameter = detuning_parameter
+        self.output_dir = output_dir
+        self.patch_idx = 0
+
+        self.combo_bounds = self._compute_combo_bounds()
+        self.validity_ranges: Dict[str, Tuple[float, float]] = dict(self.combo_bounds)
+        self.combo_keys = sorted(self.combo_bounds.keys())
+        self.selected_combo = self.combo_keys[0] if self.combo_keys else ""
+
+        self.fig, self.ax = plt.subplots(figsize=(11, 7))
+        self.fig.subplots_adjust(bottom=0.28, left=0.27)
+        self.combo_selector = RadioButtons(
+            self.fig.add_axes([0.03, 0.28, 0.21, 0.6]),
+            self.combo_keys if self.combo_keys else [""],
+        )
+        self.combo_selector.on_clicked(self._on_combo_selected)
+
+        self.slider_ax_min = self.fig.add_axes([0.30, 0.17, 0.55, 0.03])
+        self.slider_ax_max = self.fig.add_axes([0.30, 0.12, 0.55, 0.03])
+        self.slider_min: Optional[Slider] = None
+        self.slider_max: Optional[Slider] = None
+        self._build_sliders_for_combo(self.selected_combo)
+
+        self.btn_prev = Button(self.fig.add_axes([0.30, 0.05, 0.10, 0.06]), "Prev set")
+        self.btn_next = Button(self.fig.add_axes([0.42, 0.05, 0.10, 0.06]), "Next set")
+        self.btn_save = Button(self.fig.add_axes([0.55, 0.05, 0.30, 0.06]), "Save and close")
+        self.btn_prev.on_clicked(self._prev_set)
+        self.btn_next.on_clicked(self._next_set)
+        self.btn_save.on_clicked(self._save_and_close)
+
+        self._refresh_plot()
+
+    def _compute_combo_bounds(self) -> Dict[str, Tuple[float, float]]:
+        bounds: Dict[str, Tuple[float, float]] = {}
+        for _, profiles in self.patch_sets:
+            for profile in profiles:
+                params = profile.group.as_dict()
+                combo_key = self._combo_key(params)
+                kmin = float(np.nanmin(profile.k))
+                kmax = float(np.nanmax(profile.k))
+                if combo_key not in bounds:
+                    bounds[combo_key] = (kmin, kmax)
+                else:
+                    low, high = bounds[combo_key]
+                    bounds[combo_key] = (min(low, kmin), max(high, kmax))
+        return bounds
+
+    def _combo_key(self, params: Dict[str, Any]) -> str:
+        return f"{self.tof_parameter}={params[self.tof_parameter]}, {self.detuning_parameter}={params[self.detuning_parameter]}"
+
+    def _build_sliders_for_combo(self, combo_key: str) -> None:
+        self.slider_ax_min.clear()
+        self.slider_ax_max.clear()
+        if combo_key == "":
+            return
+        low, high = self.combo_bounds[combo_key]
+        current_low, current_high = self.validity_ranges[combo_key]
+
+        self.slider_min = Slider(
+            self.slider_ax_min,
+            "k min",
+            low,
+            high,
+            valinit=current_low,
+        )
+        self.slider_max = Slider(
+            self.slider_ax_max,
+            "k max",
+            low,
+            high,
+            valinit=current_high,
+        )
+        self.slider_min.on_changed(self._on_slider_change)
+        self.slider_max.on_changed(self._on_slider_change)
+
+    def _on_slider_change(self, _: float) -> None:
+        if self.selected_combo == "" or self.slider_min is None or self.slider_max is None:
+            return
+        low = float(self.slider_min.val)
+        high = float(self.slider_max.val)
+        if low > high:
+            low, high = high, low
+        self.validity_ranges[self.selected_combo] = (low, high)
+        self._refresh_plot()
+
+    def _on_combo_selected(self, combo_key: str) -> None:
+        self.selected_combo = combo_key
+        self._build_sliders_for_combo(combo_key)
+        self._refresh_plot()
+
+    def _current_patch_set(self) -> Tuple[Tuple[Tuple[str, Any], ...], List[AveragedProfile]]:
+        return self.patch_sets[self.patch_idx]
+
+    def _refresh_plot(self) -> None:
+        self.ax.clear()
+        self.ax.set_xscale("log")
+        self.ax.set_yscale("log")
+        self.ax.set_xlabel("k")
+        self.ax.set_ylabel("nk (rescaled)")
+
+        if not self.patch_sets:
+            self.ax.text(0.5, 0.5, "No data for patching.", ha="center", va="center")
+            self.fig.canvas.draw_idle()
+            return
+
+        other_params, profiles = self._current_patch_set()
+        for profile in profiles:
+            params = profile.group.as_dict()
+            combo_key = self._combo_key(params)
+            low, high = self.validity_ranges[combo_key]
+            linewidth = 2.8 if combo_key == self.selected_combo else 1.4
+            self.ax.loglog(profile.k, profile.nk, ".-", linewidth=linewidth, label=combo_key)
+            self.ax.axvspan(low, high, alpha=0.08)
+
+        other_text = ", ".join(f"{k}={v}" for k, v in other_params)
+        self.ax.set_title(
+            f"Patch set {self.patch_idx + 1}/{len(self.patch_sets)} | {other_text}"
+        )
+        self.ax.legend(loc="best", fontsize=8)
+        self.fig.canvas.draw_idle()
+
+    def _prev_set(self, _: Any) -> None:
+        if not self.patch_sets:
+            return
+        self.patch_idx = (self.patch_idx - 1) % len(self.patch_sets)
+        self._refresh_plot()
+
+    def _next_set(self, _: Any) -> None:
+        if not self.patch_sets:
+            return
+        self.patch_idx = (self.patch_idx + 1) % len(self.patch_sets)
+        self._refresh_plot()
+
+    def save(self) -> Path:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        outpath = self.output_dir / "patch_validity_ranges.json"
+        payload = {
+            key: {"k_min": values[0], "k_max": values[1]}
+            for key, values in self.validity_ranges.items()
+        }
+        outpath.write_text(json.dumps(payload, indent=2))
+        return outpath
+
+    def _save_and_close(self, _: Any) -> None:
+        self.save()
+        plt.close(self.fig)
+
+    def launch(self) -> Dict[str, Tuple[float, float]]:
+        plt.show()
+        self.save()
+        return dict(self.validity_ranges)
+
+
+def _group_for_patching(
+    profiles: Iterable[AveragedProfile],
+    tof_parameter: str,
+    detuning_parameter: str,
+) -> List[Tuple[Tuple[Tuple[str, Any], ...], List[AveragedProfile]]]:
+    grouped: Dict[Tuple[Tuple[str, Any], ...], List[AveragedProfile]] = {}
+    for profile in profiles:
+        other_params = tuple(
+            (name, value)
+            for name, value in profile.group.params
+            if name not in (tof_parameter, detuning_parameter)
+        )
+        grouped.setdefault(other_params, []).append(profile)
+
+    out = []
+    for key, grouped_profiles in grouped.items():
+        grouped_profiles.sort(
+            key=lambda p: (
+                p.group.as_dict()[tof_parameter],
+                p.group.as_dict()[detuning_parameter],
+            )
+        )
+        out.append((key, grouped_profiles))
+    out.sort(key=lambda item: item[0])
+    return out
+
+
+def _patch_profiles(
+    profiles: Sequence[AveragedProfile],
+    validity_ranges: Dict[str, Tuple[float, float]],
+    tof_parameter: str,
+    detuning_parameter: str,
+    bins_per_decade: int = 40,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    all_k: List[float] = []
+    all_nk: List[float] = []
+    all_err: List[float] = []
+
+    for profile in profiles:
+        params = profile.group.as_dict()
+        combo_key = f"{tof_parameter}={params[tof_parameter]}, {detuning_parameter}={params[detuning_parameter]}"
+        k_low, k_high = validity_ranges[combo_key]
+        valid = (
+            np.isfinite(profile.k)
+            & np.isfinite(profile.nk)
+            & np.isfinite(profile.stderr)
+            & (profile.k >= k_low)
+            & (profile.k <= k_high)
+            & (profile.k > 0)
+        )
+        all_k.extend(profile.k[valid].tolist())
+        all_nk.extend(profile.nk[valid].tolist())
+        all_err.extend(profile.stderr[valid].tolist())
+
+    if not all_k:
+        raise ValueError("No valid points available after applying patch validity ranges.")
+
+    k_arr = np.asarray(all_k, dtype=float)
+    nk_arr = np.asarray(all_nk, dtype=float)
+    err_arr = np.asarray(all_err, dtype=float)
+
+    log_min = np.log10(np.min(k_arr))
+    log_max = np.log10(np.max(k_arr))
+    num_bins = max(20, int(np.ceil((log_max - log_min) * bins_per_decade)))
+    edges = np.logspace(log_min, log_max, num_bins + 1)
+    centers = np.sqrt(edges[:-1] * edges[1:])
+
+    bin_ids = np.digitize(k_arr, edges) - 1
+    valid_bins = (bin_ids >= 0) & (bin_ids < num_bins)
+    bin_ids = bin_ids[valid_bins]
+    nk_arr = nk_arr[valid_bins]
+    err_arr = err_arr[valid_bins]
+
+    out_k: List[float] = []
+    out_nk: List[float] = []
+    out_err: List[float] = []
+    out_count: List[int] = []
+
+    for bin_idx in range(num_bins):
+        in_bin = bin_ids == bin_idx
+        if not np.any(in_bin):
+            continue
+        nk_vals = nk_arr[in_bin]
+        err_vals = err_arr[in_bin]
+
+        strictly_positive_err = err_vals > 0
+        if np.any(strictly_positive_err):
+            weights = np.zeros_like(err_vals)
+            weights[strictly_positive_err] = 1.0 / np.square(err_vals[strictly_positive_err])
+            weighted_mean = np.sum(weights * nk_vals) / np.sum(weights)
+            combined_err = np.sqrt(1.0 / np.sum(weights))
+        else:
+            weighted_mean = float(np.mean(nk_vals))
+            combined_err = (
+                float(np.std(nk_vals, ddof=1) / np.sqrt(nk_vals.size))
+                if nk_vals.size > 1
+                else 0.0
+            )
+
+        out_k.append(float(centers[bin_idx]))
+        out_nk.append(float(weighted_mean))
+        out_err.append(float(combined_err))
+        out_count.append(int(nk_vals.size))
+
+    return (
+        np.array(out_k, dtype=float),
+        np.array(out_nk, dtype=float),
+        np.array(out_err, dtype=float),
+        np.array(out_count, dtype=int),
+    )
+
+
+class MomentumDistributionPipeline:
+    def __init__(
+        self,
+        data_directory: str,
+        data_suffix: str,
+        run_parameters: RunParameters,
+        output_directory: str,
+        *,
+        sort_parameter: Optional[str] = None,
+        detuning_parameter: str = "detuning",
+        tof_parameter: str = "ToF",
+        non_detuned_value: Any = 12,
+        two_d: bool = False,
+    ):
+        self.output_directory = Path(output_directory)
+        self.output_directory.mkdir(parents=True, exist_ok=True)
+        self.detuning_parameter = detuning_parameter
+        self.tof_parameter = tof_parameter
+        self.non_detuned_value = non_detuned_value
+        self.sort_parameter = sort_parameter
+
+        self.image_processing = ImageProcessing(data_directory, data_suffix, twoD=two_d)
+        self.run_parameters = run_parameters
+        self.groups = group_run_numbers(
+            run_parameters=self.run_parameters,
+            run_numbers=self.image_processing.inums,
+            sort_parameter=sort_parameter,
+        )
+
+        self.blanks: List[int] = []
+        self.averaged_profiles: List[AveragedProfile] = []
+        self.rescaled_profiles: List[AveragedProfile] = []
+        self.patch_ranges: Dict[str, Tuple[float, float]] = {}
+
+    def remove_bad_images(self) -> List[int]:
+        gui = BadImageSelectionGUI(
+            image_processing=self.image_processing,
+            groups=self.groups,
+            output_dir=self.output_directory,
+        )
+        self.blanks = gui.launch()
+        return self.blanks
+
+    def compute_averaged_momentum_distributions(self) -> List[AveragedProfile]:
+        averaged_dir = self.output_directory / "averaged_profiles"
+        averaged_dir.mkdir(parents=True, exist_ok=True)
+        manifest = []
+        averaged_profiles: List[AveragedProfile] = []
+
+        blank_set = set(self.blanks)
+        for group in self.groups:
+            valid_runs = [inum for inum in group.run_numbers if inum not in blank_set]
+            if not valid_runs:
+                continue
+
+            profiles = []
+            for inum in valid_runs:
+                shot = self.image_processing[inum]
+                profiles.append((_ensure_numeric_array(shot["k"]), _ensure_numeric_array(shot["nk"])))
+
+            k_vals, nk_vals, stderr_vals, n_counts = average_profiles(profiles)
+            averaged_profile = AveragedProfile(
+                group=group,
+                run_numbers=valid_runs,
+                k=k_vals,
+                nk=nk_vals,
+                stderr=stderr_vals,
+                n_shots_per_point=n_counts,
+            )
+            averaged_profiles.append(averaged_profile)
+
+            file_name = f"{group.key}.csv"
+            file_path = averaged_dir / file_name
+            _write_profile_csv(file_path, k_vals, nk_vals, stderr_vals, n_counts)
+            manifest.append(
+                {
+                    "group": group.as_dict(),
+                    "group_key": group.key,
+                    "run_numbers": valid_runs,
+                    "file": file_name,
+                }
+            )
+
+        (averaged_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+        self.averaged_profiles = averaged_profiles
+        return averaged_profiles
+
+    def rescale_detuned_images(self) -> List[AveragedProfile]:
+        if not self.averaged_profiles:
+            raise ValueError("No averaged profiles. Run compute_averaged_momentum_distributions() first.")
+
+        rescale_dir = self.output_directory / "rescaled_profiles"
+        rescale_gui = DetuningRescaleGUI(
+            averaged_profiles=self.averaged_profiles,
+            detuning_parameter=self.detuning_parameter,
+            non_detuned_value=self.non_detuned_value,
+            output_dir=self.output_directory,
+            sort_parameter=self.sort_parameter,
+        )
+        scale_factors = rescale_gui.launch()
+
+        rescaled_profiles: List[AveragedProfile] = []
+        manifest = []
+        for profile in self.averaged_profiles:
+            factor = float(scale_factors.get(profile.group.key, 1.0))
+            scaled_profile = AveragedProfile(
+                group=profile.group,
+                run_numbers=list(profile.run_numbers),
+                k=np.copy(profile.k),
+                nk=np.copy(profile.nk) * factor,
+                stderr=np.copy(profile.stderr) * factor,
+                n_shots_per_point=np.copy(profile.n_shots_per_point),
+                scale_factor=factor,
+            )
+            rescaled_profiles.append(scaled_profile)
+            file_name = f"{profile.group.key}.csv"
+            _write_profile_csv(
+                rescale_dir / file_name,
+                scaled_profile.k,
+                scaled_profile.nk,
+                scaled_profile.stderr,
+                scaled_profile.n_shots_per_point,
+            )
+            manifest.append(
+                {
+                    "group": profile.group.as_dict(),
+                    "group_key": profile.group.key,
+                    "scale_factor": factor,
+                    "file": file_name,
+                }
+            )
+
+        (rescale_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+        self.rescaled_profiles = rescaled_profiles
+        return rescaled_profiles
+
+    def select_patch_validity_ranges(self) -> Dict[str, Tuple[float, float]]:
+        if not self.rescaled_profiles:
+            raise ValueError("No rescaled profiles. Run rescale_detuned_images() first.")
+        patch_sets = _group_for_patching(
+            self.rescaled_profiles,
+            tof_parameter=self.tof_parameter,
+            detuning_parameter=self.detuning_parameter,
+        )
+        gui = PatchRangesGUI(
+            patch_sets=patch_sets,
+            tof_parameter=self.tof_parameter,
+            detuning_parameter=self.detuning_parameter,
+            output_dir=self.output_directory,
+        )
+        self.patch_ranges = gui.launch()
+        return self.patch_ranges
+
+    def patch_tofs_and_detunings(self) -> Path:
+        if not self.rescaled_profiles:
+            raise ValueError("No rescaled profiles. Run rescale_detuned_images() first.")
+        if not self.patch_ranges:
+            raise ValueError("Patch validity ranges not set. Run select_patch_validity_ranges() first.")
+
+        final_dir = self.output_directory / "final_profiles"
+        final_dir.mkdir(parents=True, exist_ok=True)
+        patch_sets = _group_for_patching(
+            self.rescaled_profiles,
+            tof_parameter=self.tof_parameter,
+            detuning_parameter=self.detuning_parameter,
+        )
+        manifest = []
+
+        for other_params, profiles in patch_sets:
+            k_vals, nk_vals, stderr_vals, n_counts = _patch_profiles(
+                profiles=profiles,
+                validity_ranges=self.patch_ranges,
+                tof_parameter=self.tof_parameter,
+                detuning_parameter=self.detuning_parameter,
+            )
+            key_text = "__".join(f"{k}={str(v).replace('/', '_')}" for k, v in other_params)
+            file_name = f"{key_text if key_text else 'all_params'}.csv"
+            _write_profile_csv(final_dir / file_name, k_vals, nk_vals, stderr_vals, n_counts)
+            manifest.append(
+                {
+                    "other_parameters": dict(other_params),
+                    "file": file_name,
+                    "components": [profile.group.as_dict() for profile in profiles],
+                }
+            )
+
+        (final_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+        return final_dir
+
+
+def run_full_pipeline(
+    data_directory: str,
+    data_suffix: str,
+    run_parameters: RunParameters,
+    output_directory: str,
+    *,
+    sort_parameter: Optional[str] = None,
+    detuning_parameter: str = "detuning",
+    tof_parameter: str = "ToF",
+    non_detuned_value: Any = 12,
+    two_d: bool = False,
+) -> MomentumDistributionPipeline:
+    pipeline = MomentumDistributionPipeline(
+        data_directory=data_directory,
+        data_suffix=data_suffix,
+        run_parameters=run_parameters,
+        output_directory=output_directory,
+        sort_parameter=sort_parameter,
+        detuning_parameter=detuning_parameter,
+        tof_parameter=tof_parameter,
+        non_detuned_value=non_detuned_value,
+        two_d=two_d,
+    )
+    pipeline.remove_bad_images()
+    pipeline.compute_averaged_momentum_distributions()
+    pipeline.rescale_detuned_images()
+    pipeline.select_patch_validity_ranges()
+    pipeline.patch_tofs_and_detunings()
+    return pipeline

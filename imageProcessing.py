@@ -127,9 +127,43 @@ class ImageProcessing:
             filepath_nk = f"{self.directory}/nk2d_{self.suffix}.txt"
         filepath_ds = f"{self.directory}/ds_{self.suffix}.txt"
 
-        self.k_data = np.genfromtxt(filepath_k, names=True)
-        self.nk_data = np.genfromtxt(filepath_nk, names=True)
-        self.calc_data = np.genfromtxt(filepath_ds, names=True, delimiter=",")
+        # k3d/nk3d files are large CSV-like files where the first line is the
+        # column names (e.g. i591,i592,...) and subsequent lines contain
+        # one k (or nk) value per column. numpy.genfromtxt struggles on some
+        # of these files (mixed types/encodings), so parse them robustly here.
+        def _read_matrix_file(path: str) -> Dict[str, np.ndarray]:
+            with open(path, "r", encoding="utf-8", errors="surrogateescape") as f:
+                header = f.readline().strip()
+                if not header:
+                    raise ValueError(f"Empty header in {path}")
+                fields = header.split(",")
+                ncols = len(fields)
+                cols: List[List[float]] = [[] for _ in range(ncols)]
+
+                for line in f:
+                    parts = line.strip().split(",")
+                    if len(parts) != ncols:
+                        # If line length mismatch, try to pad/truncate to ncols
+                        if len(parts) < ncols:
+                            parts += [""] * (ncols - len(parts))
+                        else:
+                            parts = parts[:ncols]
+                    for i, p in enumerate(parts):
+                        try:
+                            cols[i].append(float(p))
+                        except Exception:
+                            # treat empty as nan
+                            cols[i].append(float("nan"))
+
+                return {name: np.asarray(col, dtype=float) for name, col in zip(fields, cols)}
+
+        self.k_data = _read_matrix_file(filepath_k)
+        self.nk_data = _read_matrix_file(filepath_nk)
+        # For the ds file, detect delimiter (tab or comma) then load
+        with open(filepath_ds, 'r', encoding='utf-8', errors='surrogateescape') as f:
+            first = f.readline()
+        ds_delim = '\t' if '\t' in first else ','
+        self.calc_data = np.genfromtxt(filepath_ds, names=True, delimiter=ds_delim)
 
 
     def _get_from_inum(self, inum: int) -> Dict[str, Any]:
@@ -140,6 +174,46 @@ class ImageProcessing:
             nk_values = self.nk_data[field]
         except ValueError as e:
             raise KeyError(f"No k/nk data for image number {inum}") from e
+
+        # Some k/nk files are read by genfromtxt as strings containing comma-separated
+        # lists (or as arrays of byte-strings). Normalize into numpy float arrays here.
+        def _parse_value(val):
+            # Handle numpy scalars
+            if isinstance(val, (bytes, str)):
+                s = val.decode() if isinstance(val, bytes) else val
+                parts = [p for p in s.split(',') if p.strip() != '']
+                return np.asarray([float(p) for p in parts], dtype=float)
+            if isinstance(val, np.ndarray):
+                # If numeric already, return as float array
+                if np.issubdtype(val.dtype, np.number):
+                    return np.asarray(val, dtype=float)
+                # If 0-d array with a string-like item
+                if val.ndim == 0:
+                    item = val.item()
+                    return _parse_value(item)
+                # 1-d array of strings or bytes
+                if val.dtype.kind in ('U', 'S'):
+                    try:
+                        return val.astype(float)
+                    except Exception:
+                        # join all entries and split by comma
+                        joined = ','.join([x.decode() if isinstance(x, bytes) else str(x) for x in val])
+                        parts = [p for p in joined.split(',') if p.strip() != '']
+                        return np.asarray([float(p) for p in parts], dtype=float)
+                # object array: maybe contains lists
+                if val.dtype == object:
+                    first = val.flat[0]
+                    if isinstance(first, (list, tuple, np.ndarray)):
+                        return np.asarray(first, dtype=float)
+                    return _parse_value(first)
+            # Fallback: try converting directly
+            try:
+                return np.asarray(val, dtype=float)
+            except Exception:
+                raise ValueError(f"Cannot parse k/nk values for image {inum}: {val}")
+
+        k_arr = _parse_value(k_values)
+        nk_arr = _parse_value(nk_values)
 
         # Locate the row in calc_data whose ImageNumber matches inum.
         # Use integer comparison to avoid issues if genfromtxt produced floats.
@@ -152,8 +226,8 @@ class ImageProcessing:
         calc_values = self.calc_data[idx]
 
         return {
-            "k": k_values,
-            "nk": nk_values,
+            "k": k_arr,
+            "nk": nk_arr,
             "calc": calc_values,
         }
     
