@@ -491,9 +491,9 @@ class DetuningRescaleGUI:
         self.btn_apply_limits.on_clicked(self._apply_limits)
         self.btn_reset_limits.on_clicked(self._reset_limits)
 
-        # initialize default axis limits to None (auto)
+        # initialize default axis limits
         self._default_xlim = None
-        self._default_ylim = None
+        self._default_ylim = (100.0, 1e7)
         # persistent user-specified limits (None means not set)
         self.user_xlim: Optional[Tuple[float, float]] = None
         self.user_ylim: Optional[Tuple[float, float]] = None
@@ -727,41 +727,46 @@ class DetuningRescaleGUI:
         self.pair_idx = (self.pair_idx + 1) % len(self.pairs)
         self._refresh_plot()
 
-    def _all_scale_factors(self) -> Dict[str, float]:
-        # Return a mapping group_key -> factor, applying the same factor to all groups
-        # that share the same detuning value. Prioritize tentative (Apply) then confirmed (Confirm)
-        factors: Dict[str, float] = {}
-        for profile in self.all_profiles:
-            params = profile.group.as_dict()
-            detuning_value = params.get(self.detuning_parameter)
-            # use tentative factor if present, otherwise confirmed, otherwise estimate
-            if detuning_value in self.tentative_scales:
+    def _detuning_scale_factors(self) -> Dict[Any, float]:
+        # Return a mapping detuning_value -> factor, shared across all other parameters.
+        factors: Dict[Any, float] = {}
+        detuning_values = {
+            profile.group.as_dict().get(self.detuning_parameter)
+            for profile in self.all_profiles
+        }
+        for detuning_value in detuning_values:
+            if detuning_value == self.non_detuned_value:
+                factor = 1.0
+            elif detuning_value in self.tentative_scales:
                 factor = float(self.tentative_scales[detuning_value])
             elif detuning_value in self.confirmed_scales:
                 factor = float(self.confirmed_scales[detuning_value])
             else:
-                # find a reference pair for this profile to estimate scale
-                # fall back to 1.0
-                matching = [pair for pair in self.pairs if pair[0].group.as_dict().get(self.detuning_parameter) == detuning_value]
+                matching = [
+                    pair
+                    for pair in self.pairs
+                    if pair[0].group.as_dict().get(self.detuning_parameter) == detuning_value
+                ]
                 if matching:
                     factor = float(self._estimate_initial_scale(matching[0][0], matching[0][1]))
                 else:
                     factor = 1.0
-            factors[profile.group.key] = factor
+            factors[detuning_value] = factor
         return factors
 
-    def save(self) -> Tuple[Path, Dict[str, float]]:
+    def save(self) -> Tuple[Path, Dict[Any, float]]:
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        factors = self._all_scale_factors()
+        factors = self._detuning_scale_factors()
         outpath = self.output_dir / "detuning_rescale_factors.json"
-        outpath.write_text(json.dumps(factors, indent=2))
+        json_payload = {str(detuning): factor for detuning, factor in factors.items()}
+        outpath.write_text(json.dumps(json_payload, indent=2))
         return outpath, factors
 
     def _save_and_close(self, _: Any) -> None:
         self.save()
         plt.close(self.fig)
 
-    def launch(self) -> Dict[str, float]:
+    def launch(self) -> Dict[Any, float]:
         plt.show()
         _, factors = self.save()
         return factors
@@ -783,7 +788,22 @@ class PatchRangesGUI:
 
         self.combo_bounds = self._compute_combo_bounds()
         self.validity_ranges: Dict[str, Tuple[float, float]] = dict(self.combo_bounds)
-        self.combo_keys = sorted(self.combo_bounds.keys())
+        # Select combinations by increasing detuning, then decreasing time of flight.
+        # Use two stable sorts so the requested descending secondary ordering is
+        # retained without needing to negate parameter values.
+        self.combo_keys = sorted(
+            sorted(
+                self.combo_bounds,
+                key=lambda key: self._sortable_value(self.combo_values[key][1]),
+                reverse=True,
+            ),
+            key=lambda key: self._sortable_value(self.combo_values[key][0]),
+        )
+        colour_map = plt.get_cmap("tab20", max(len(self.combo_keys), 1))
+        self.combo_colors = {
+            combo_key: colour_map(index)
+            for index, combo_key in enumerate(self.combo_keys)
+        }
         self.selected_combo = self.combo_keys[0] if self.combo_keys else ""
 
         self.fig, self.ax = plt.subplots(figsize=(11, 7))
@@ -811,10 +831,15 @@ class PatchRangesGUI:
 
     def _compute_combo_bounds(self) -> Dict[str, Tuple[float, float]]:
         bounds: Dict[str, Tuple[float, float]] = {}
+        self.combo_values: Dict[str, Tuple[Any, Any]] = {}
         for _, profiles in self.patch_sets:
             for profile in profiles:
                 params = profile.group.as_dict()
                 combo_key = self._combo_key(params)
+                self.combo_values[combo_key] = (
+                    params[self.detuning_parameter],
+                    params[self.tof_parameter],
+                )
                 kmin = float(np.nanmin(profile.k))
                 kmax = float(np.nanmax(profile.k))
                 if combo_key not in bounds:
@@ -823,6 +848,14 @@ class PatchRangesGUI:
                     low, high = bounds[combo_key]
                     bounds[combo_key] = (min(low, kmin), max(high, kmax))
         return bounds
+
+    @staticmethod
+    def _sortable_value(value: Any) -> Tuple[int, Any]:
+        """Sort numerical parameter values numerically, with a text fallback."""
+        try:
+            return (0, float(value))
+        except (TypeError, ValueError):
+            return (1, str(value))
 
     def _combo_key(self, params: Dict[str, Any]) -> str:
         return f"{self.tof_parameter}={params[self.tof_parameter]}, {self.detuning_parameter}={params[self.detuning_parameter]}"
@@ -835,31 +868,44 @@ class PatchRangesGUI:
         low, high = self.combo_bounds[combo_key]
         current_low, current_high = self.validity_ranges[combo_key]
 
+        if low <= 0 or high <= 0:
+            raise ValueError("Patch validity ranges require strictly positive k values.")
+        log_low, log_high = np.log10((low, high))
+
         self.slider_min = Slider(
             self.slider_ax_min,
             "k min",
-            low,
-            high,
-            valinit=current_low,
+            log_low,
+            log_high,
+            valinit=np.log10(current_low),
         )
         self.slider_max = Slider(
             self.slider_ax_max,
             "k max",
-            low,
-            high,
-            valinit=current_high,
+            log_low,
+            log_high,
+            valinit=np.log10(current_high),
         )
+        self._update_slider_value_labels()
         self.slider_min.on_changed(self._on_slider_change)
         self.slider_max.on_changed(self._on_slider_change)
+
+    def _update_slider_value_labels(self) -> None:
+        """Show physical k values while the slider positions use log10(k)."""
+        if self.slider_min is not None:
+            self.slider_min.valtext.set_text(f"{10 ** self.slider_min.val:.3g}")
+        if self.slider_max is not None:
+            self.slider_max.valtext.set_text(f"{10 ** self.slider_max.val:.3g}")
 
     def _on_slider_change(self, _: float) -> None:
         if self.selected_combo == "" or self.slider_min is None or self.slider_max is None:
             return
-        low = float(self.slider_min.val)
-        high = float(self.slider_max.val)
+        low = float(10 ** self.slider_min.val)
+        high = float(10 ** self.slider_max.val)
         if low > high:
             low, high = high, low
         self.validity_ranges[self.selected_combo] = (low, high)
+        self._update_slider_value_labels()
         self._refresh_plot()
 
     def _on_combo_selected(self, combo_key: str) -> None:
@@ -883,13 +929,29 @@ class PatchRangesGUI:
             return
 
         other_params, profiles = self._current_patch_set()
-        for profile in profiles:
+        # Draw unselected profiles first, then redraw the selected profile last.
+        # This gives it the highest z-order even where curves overlap.
+        ordered_profiles = sorted(
+            profiles,
+            key=lambda profile: self._combo_key(profile.group.as_dict()) == self.selected_combo,
+        )
+        for profile in ordered_profiles:
             params = profile.group.as_dict()
             combo_key = self._combo_key(params)
             low, high = self.validity_ranges[combo_key]
             linewidth = 2.8 if combo_key == self.selected_combo else 1.4
-            self.ax.loglog(profile.k, profile.nk, ".-", linewidth=linewidth, label=combo_key)
-            self.ax.axvspan(low, high, alpha=0.08)
+            zorder = 3 if combo_key == self.selected_combo else 2
+            in_valid_range = (profile.k >= low) & (profile.k <= high)
+            if np.any(in_valid_range):
+                self.ax.loglog(
+                    profile.k[in_valid_range],
+                    profile.nk[in_valid_range],
+                    ".-",
+                    linewidth=linewidth,
+                    label=combo_key,
+                    color=self.combo_colors[combo_key],
+                    zorder=zorder,
+                )
 
         other_text = ", ".join(f"{k}={v}" for k, v in other_params)
         self.ax.set_title(
@@ -1141,12 +1203,18 @@ class MomentumDistributionPipeline:
             output_dir=self.output_directory,
             sort_parameter=self.sort_parameter,
         )
-        scale_factors = rescale_gui.launch()
+        detuning_scale_factors = rescale_gui.launch()
 
         rescaled_profiles: List[AveragedProfile] = []
         manifest = []
         for profile in self.averaged_profiles:
-            factor = float(scale_factors.get(profile.group.key, 1.0))
+            detuning_value = profile.group.as_dict().get(self.detuning_parameter)
+            factor = float(
+                detuning_scale_factors.get(
+                    detuning_value,
+                    detuning_scale_factors.get(str(detuning_value), 1.0),
+                )
+            )
             scaled_profile = AveragedProfile(
                 group=profile.group,
                 run_numbers=list(profile.run_numbers),
