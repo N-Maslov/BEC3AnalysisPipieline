@@ -68,6 +68,12 @@ Rescaled profiles are retained in memory for patching but are not saved separate
 they are fully reproducible by applying `detuning_rescale_factors.json` to the
 matching files in `averaged_profiles/`.
 
+Final profiles are constructed on logarithmic k bins. Within each bin, each
+`(ToF, detuning)` combination contributes one local log-log estimate at the bin
+centre; those estimates are then inverse-variance weighted together. The final
+CSV therefore uses `n_combinations` for its fourth column rather than
+`n_shots`.
+
 ## Step-by-step (non-wrapper) usage
 
 If you want to run each stage explicitly:

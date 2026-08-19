@@ -216,38 +216,36 @@ class BadImageSelectionGUI:
 
         self.group_idx = 0
         self.manual_blanks: set[int] = set()
-        self.sigma_thresholds: Dict[str, Tuple[float, float]] = {
-            group.key: (3.0, 3.0) for group in self.groups
-        }
+        self.sigma_thresholds: Tuple[float, float] = (3.0, 3.0)
         self.sigma_blanks_by_group: Dict[str, set[int]] = {group.key: set() for group in self.groups}
         self.artist_to_inum: Dict[Any, int] = {}
 
-        self.fig, self.axes = plt.subplots(1, 3, figsize=(16, 6))
-        self.fig.subplots_adjust(bottom=0.28, wspace=0.3)
+        self.fig, self.axes = plt.subplots(1, 3, figsize=(18, 8))
+        self.fig.subplots_adjust(bottom=0.30, top=0.84, wspace=0.32)
         self.ax_profiles, self.ax_n, self.ax_energy = self.axes
 
         self.low_sigma_slider = Slider(
-            self.fig.add_axes([0.16, 0.19, 0.32, 0.03]),
-            "Lower sigma",
+            self.fig.add_axes([0.12, 0.19, 0.32, 0.035]),
+            "Global lower σ",
             0.0,
             6.0,
             valinit=3.0,
             valstep=0.1,
         )
         self.high_sigma_slider = Slider(
-            self.fig.add_axes([0.16, 0.13, 0.32, 0.03]),
-            "Upper sigma",
+            self.fig.add_axes([0.12, 0.12, 0.32, 0.035]),
+            "Global upper σ",
             0.0,
             6.0,
             valinit=3.0,
             valstep=0.1,
         )
 
-        self.btn_prev = Button(self.fig.add_axes([0.52, 0.16, 0.08, 0.06]), "Prev")
-        self.btn_next = Button(self.fig.add_axes([0.61, 0.16, 0.08, 0.06]), "Next")
-        self.btn_reset_group = Button(self.fig.add_axes([0.70, 0.16, 0.12, 0.06]), "Reset group")
-        self.btn_reset_all = Button(self.fig.add_axes([0.83, 0.16, 0.12, 0.06]), "Reset all")
-        self.btn_save = Button(self.fig.add_axes([0.70, 0.08, 0.25, 0.06]), "Save and close")
+        self.btn_prev = Button(self.fig.add_axes([0.52, 0.17, 0.09, 0.06]), "Previous")
+        self.btn_next = Button(self.fig.add_axes([0.63, 0.17, 0.09, 0.06]), "Next")
+        self.btn_reset_group = Button(self.fig.add_axes([0.74, 0.17, 0.18, 0.06]), "Unblank group")
+        self.btn_reset_all = Button(self.fig.add_axes([0.52, 0.07, 0.18, 0.06]), "Reset all")
+        self.btn_save = Button(self.fig.add_axes([0.72, 0.07, 0.20, 0.06]), "Save and close")
 
         self.low_sigma_slider.on_changed(self._on_sigma_changed)
         self.high_sigma_slider.on_changed(self._on_sigma_changed)
@@ -258,6 +256,7 @@ class BadImageSelectionGUI:
         self.btn_save.on_clicked(self._save_and_close)
         self.fig.canvas.mpl_connect("pick_event", self._on_pick)
 
+        self._recalculate_sigma_blanks()
         self._refresh_plot()
 
     def _current_group(self) -> ParameterGroup:
@@ -292,11 +291,16 @@ class BadImageSelectionGUI:
                     blanks.add(run_numbers[idx])
         return blanks
 
+    def _recalculate_sigma_blanks(self) -> None:
+        low_sigma, high_sigma = self.sigma_thresholds
+        self.sigma_blanks_by_group = {
+            group.key: self._calc_sigma_blanks(group, low_sigma, high_sigma)
+            for group in self.groups
+        }
+
     def _refresh_plot(self) -> None:
         group = self._current_group()
         params = group.as_dict()
-        low_sigma, high_sigma = self.sigma_thresholds[group.key]
-        self.sigma_blanks_by_group[group.key] = self._calc_sigma_blanks(group, low_sigma, high_sigma)
         group_blanks = self.sigma_blanks_by_group[group.key] | self.manual_blanks
 
         self.artist_to_inum.clear()
@@ -375,43 +379,34 @@ class BadImageSelectionGUI:
         self._refresh_plot()
 
     def _on_sigma_changed(self, _: float) -> None:
-        group = self._current_group()
-        self.sigma_thresholds[group.key] = (
+        self.sigma_thresholds = (
             float(self.low_sigma_slider.val),
             float(self.high_sigma_slider.val),
         )
+        self._recalculate_sigma_blanks()
         self._refresh_plot()
 
     def _prev_group(self, _: Any) -> None:
         self.group_idx = (self.group_idx - 1) % len(self.groups)
-        self._sync_sliders_from_group()
         self._refresh_plot()
 
     def _next_group(self, _: Any) -> None:
         self.group_idx = (self.group_idx + 1) % len(self.groups)
-        self._sync_sliders_from_group()
         self._refresh_plot()
-
-    def _sync_sliders_from_group(self) -> None:
-        group = self._current_group()
-        low_sigma, high_sigma = self.sigma_thresholds[group.key]
-        self.low_sigma_slider.set_val(low_sigma)
-        self.high_sigma_slider.set_val(high_sigma)
 
     def _reset_group(self, _: Any) -> None:
         group = self._current_group()
         for inum in group.run_numbers:
             if inum in self.manual_blanks:
                 self.manual_blanks.remove(inum)
-        self.sigma_thresholds[group.key] = (3.0, 3.0)
-        self._sync_sliders_from_group()
         self._refresh_plot()
 
     def _reset_all(self, _: Any) -> None:
         self.manual_blanks.clear()
-        self.sigma_thresholds = {group.key: (3.0, 3.0) for group in self.groups}
-        self.sigma_blanks_by_group = {group.key: set() for group in self.groups}
-        self._sync_sliders_from_group()
+        self.sigma_thresholds = (3.0, 3.0)
+        self.low_sigma_slider.set_val(3.0)
+        self.high_sigma_slider.set_val(3.0)
+        self._recalculate_sigma_blanks()
         self._refresh_plot()
 
     def save(self) -> Path:
@@ -421,8 +416,8 @@ class BadImageSelectionGUI:
             "blank_image_numbers": self._effective_blanks(),
             "manual_blanks": sorted(self.manual_blanks),
             "sigma_thresholds": {
-                key: {"lower_sigma": values[0], "upper_sigma": values[1]}
-                for key, values in self.sigma_thresholds.items()
+                "lower_sigma": self.sigma_thresholds[0],
+                "upper_sigma": self.sigma_thresholds[1],
             },
         }
         outpath.write_text(json.dumps(payload, indent=2))
@@ -459,43 +454,43 @@ class DetuningRescaleGUI:
         }
         # pairs: list of (detuned_profile, reference_profile)
         self.pairs = self._build_pairs()
-        # confirmed scales keyed by detuning value (so one scale per detuning)
+        # Saved scales are keyed by detuning value (one scale per detuning).
         self.confirmed_scales: Dict[Any, float] = {}
-        # tentative scales set by Apply (not yet confirmed)
-        self.tentative_scales: Dict[Any, float] = {}
         self.pair_idx = 0
         self.current_scale = 1.0
 
-        self.fig, self.ax = plt.subplots(figsize=(10, 6))
-        self.fig.subplots_adjust(bottom=0.28)
+        self.fig, self.ax = plt.subplots(figsize=(12, 8))
+        self.fig.subplots_adjust(bottom=0.31, top=0.92)
         self.ax.set_xscale("log")
         self.ax.set_yscale("log")
         self.ax.set_xlabel("k")
         self.ax.set_ylabel("nk")
 
-        # scale input and control buttons
-        self.scale_box = TextBox(self.fig.add_axes([0.12, 0.12, 0.18, 0.05]), "Scale")
-        self.btn_apply = Button(self.fig.add_axes([0.31, 0.12, 0.09, 0.05]), "Apply")
-        self.btn_confirm = Button(self.fig.add_axes([0.41, 0.12, 0.09, 0.05]), "Confirm")
-        self.btn_prev = Button(self.fig.add_axes([0.52, 0.12, 0.08, 0.05]), "Prev")
-        self.btn_next = Button(self.fig.add_axes([0.61, 0.12, 0.08, 0.05]), "Next")
-        self.btn_save = Button(self.fig.add_axes([0.70, 0.12, 0.20, 0.05]), "Save and close")
+        # Enter previews a scale. "Save scale & next" persists it globally for
+        # this detuning and advances to the next comparison.
+        self.fig.text(0.06, 0.235, "Scale factor", ha="left", va="bottom")
+        self.scale_box = TextBox(self.fig.add_axes([0.06, 0.17, 0.16, 0.055]), "")
+        self.btn_confirm = Button(self.fig.add_axes([0.25, 0.17, 0.18, 0.055]), "Save scale & next")
+        self.btn_prev = Button(self.fig.add_axes([0.46, 0.17, 0.10, 0.055]), "Previous")
+        self.btn_next = Button(self.fig.add_axes([0.58, 0.17, 0.10, 0.055]), "Next")
+        self.btn_save = Button(self.fig.add_axes([0.72, 0.17, 0.20, 0.055]), "Save and close")
 
-        # axis limit controls (user settable)
-        self.xmin_box = TextBox(self.fig.add_axes([0.12, 0.05, 0.12, 0.05]), "x min")
-        self.xmax_box = TextBox(self.fig.add_axes([0.25, 0.05, 0.12, 0.05]), "x max")
-        self.ymin_box = TextBox(self.fig.add_axes([0.38, 0.05, 0.12, 0.05]), "y min")
-        self.ymax_box = TextBox(self.fig.add_axes([0.51, 0.05, 0.12, 0.05]), "y max")
-        self.btn_apply_limits = Button(self.fig.add_axes([0.64, 0.05, 0.08, 0.05]), "Apply lims")
-        self.btn_reset_limits = Button(self.fig.add_axes([0.73, 0.05, 0.12, 0.05]), "Reset lims")
+        # Put labels above the text boxes so they cannot be clipped by them.
+        for x_position, label in ((0.06, "x min"), (0.20, "x max"), (0.34, "y min"), (0.48, "y max")):
+            self.fig.text(x_position, 0.115, label, ha="left", va="bottom")
+        self.xmin_box = TextBox(self.fig.add_axes([0.06, 0.055, 0.12, 0.045]), "")
+        self.xmax_box = TextBox(self.fig.add_axes([0.20, 0.055, 0.12, 0.045]), "")
+        self.ymin_box = TextBox(self.fig.add_axes([0.34, 0.055, 0.12, 0.045]), "")
+        self.ymax_box = TextBox(self.fig.add_axes([0.48, 0.055, 0.12, 0.045]), "")
+        self.btn_apply_limits = Button(self.fig.add_axes([0.63, 0.055, 0.13, 0.045]), "Apply limits")
+        self.btn_reset_limits = Button(self.fig.add_axes([0.78, 0.055, 0.14, 0.045]), "Reset limits")
 
         # callbacks
-        self.btn_apply.on_clicked(self._apply_scale)
         self.btn_confirm.on_clicked(self._confirm_scale)
         self.btn_prev.on_clicked(self._prev_pair)
         self.btn_next.on_clicked(self._next_pair)
         self.btn_save.on_clicked(self._save_and_close)
-        self.scale_box.on_submit(lambda txt: self._apply_scale(None))
+        self.scale_box.on_submit(lambda txt: self._preview_scale())
         self.btn_apply_limits.on_clicked(self._apply_limits)
         self.btn_reset_limits.on_clicked(self._reset_limits)
 
@@ -607,7 +602,7 @@ class DetuningRescaleGUI:
     def _current_pair(self) -> Tuple[AveragedProfile, AveragedProfile]:
         return self.pairs[self.pair_idx]
 
-    def _refresh_plot(self) -> None:
+    def _refresh_plot(self, keep_preview: bool = False) -> None:
         self.ax.clear()
         self.ax.set_xscale("log")
         self.ax.set_yscale("log")
@@ -622,14 +617,13 @@ class DetuningRescaleGUI:
         detuned, reference = self._current_pair()
         detuning_value = detuned.group.as_dict().get(self.detuning_parameter)
 
-        # set current scale: prioritize tentative (Apply) then confirmed (Confirm) then initial estimate
-        if detuning_value in self.tentative_scales:
-            self.current_scale = self.tentative_scales[detuning_value]
-        elif detuning_value in self.confirmed_scales:
-            self.current_scale = self.confirmed_scales[detuning_value]
-        else:
-            self.current_scale = self._initial_scale_for_detuning(detuning_value)
-        self.scale_box.set_val(f"{self.current_scale:.6g}")
+        if not keep_preview:
+            # Prefer a saved value for this detuning; otherwise use an estimate.
+            if detuning_value in self.confirmed_scales:
+                self.current_scale = self.confirmed_scales[detuning_value]
+            else:
+                self.current_scale = self._initial_scale_for_detuning(detuning_value)
+            self.scale_box.set_val(f"{self.current_scale:.6g}")
 
         scaled_nk = detuned.nk * self.current_scale
         scaled_err = detuned.stderr * self.current_scale
@@ -691,7 +685,7 @@ class DetuningRescaleGUI:
         self.ax.legend(loc="best")
         self.fig.canvas.draw_idle()
 
-    def _apply_scale(self, _: Any) -> None:
+    def _preview_scale(self) -> None:
         if not self.pairs:
             return
         try:
@@ -702,23 +696,15 @@ class DetuningRescaleGUI:
         if value <= 0:
             raise ValueError("Scale factor must be positive.")
         self.current_scale = value
-        # set tentative scale for this detuning (Apply only shows it; Confirm persists)
-        detuned, _ = self._current_pair()
-        detuning_value = detuned.group.as_dict().get(self.detuning_parameter)
-        self.tentative_scales[detuning_value] = self.current_scale
-        self._refresh_plot()
+        self._refresh_plot(keep_preview=True)
 
     def _confirm_scale(self, _: Any) -> None:
         if not self.pairs:
             return
+        self._preview_scale()
         detuned, _ = self._current_pair()
         detuning_value = detuned.group.as_dict().get(self.detuning_parameter)
-        # persist the tentative/current scale for this detuning value
-        if detuning_value in self.tentative_scales:
-            self.confirmed_scales[detuning_value] = self.tentative_scales[detuning_value]
-        else:
-            self.confirmed_scales[detuning_value] = self.current_scale
-        # advance to next pair
+        self.confirmed_scales[detuning_value] = self.current_scale
         if self.pair_idx < len(self.pairs) - 1:
             self.pair_idx += 1
         self._refresh_plot()
@@ -745,8 +731,6 @@ class DetuningRescaleGUI:
         for detuning_value in detuning_values:
             if detuning_value == self.non_detuned_value:
                 factor = 1.0
-            elif detuning_value in self.tentative_scales:
-                factor = float(self.tentative_scales[detuning_value])
             elif detuning_value in self.confirmed_scales:
                 factor = float(self.confirmed_scales[detuning_value])
             else:
@@ -814,23 +798,23 @@ class PatchRangesGUI:
         }
         self.selected_combo = self.combo_keys[0] if self.combo_keys else ""
 
-        self.fig, self.ax = plt.subplots(figsize=(11, 7))
-        self.fig.subplots_adjust(bottom=0.28, left=0.27)
+        self.fig, self.ax = plt.subplots(figsize=(13, 8))
+        self.fig.subplots_adjust(bottom=0.25, left=0.31, top=0.92)
         self.combo_selector = RadioButtons(
-            self.fig.add_axes([0.03, 0.28, 0.21, 0.6]),
+            self.fig.add_axes([0.02, 0.25, 0.25, 0.64]),
             self.combo_keys if self.combo_keys else [""],
         )
         self.combo_selector.on_clicked(self._on_combo_selected)
 
-        self.slider_ax_min = self.fig.add_axes([0.30, 0.17, 0.55, 0.03])
-        self.slider_ax_max = self.fig.add_axes([0.30, 0.12, 0.55, 0.03])
+        self.slider_ax_min = self.fig.add_axes([0.34, 0.15, 0.56, 0.035])
+        self.slider_ax_max = self.fig.add_axes([0.34, 0.09, 0.56, 0.035])
         self.slider_min: Optional[Slider] = None
         self.slider_max: Optional[Slider] = None
         self._build_sliders_for_combo(self.selected_combo)
 
-        self.btn_prev = Button(self.fig.add_axes([0.30, 0.05, 0.10, 0.06]), "Prev set")
-        self.btn_next = Button(self.fig.add_axes([0.42, 0.05, 0.10, 0.06]), "Next set")
-        self.btn_save = Button(self.fig.add_axes([0.55, 0.05, 0.30, 0.06]), "Save and close")
+        self.btn_prev = Button(self.fig.add_axes([0.34, 0.02, 0.13, 0.055]), "Previous set")
+        self.btn_next = Button(self.fig.add_axes([0.49, 0.02, 0.13, 0.055]), "Next set")
+        self.btn_save = Button(self.fig.add_axes([0.65, 0.02, 0.25, 0.055]), "Save and close")
         self.btn_prev.on_clicked(self._prev_set)
         self.btn_next.on_clicked(self._next_set)
         self.btn_save.on_clicked(self._save_and_close)
@@ -1037,6 +1021,7 @@ def _patch_profiles(
     all_k: List[float] = []
     all_nk: List[float] = []
     all_err: List[float] = []
+    all_combos: List[str] = []
 
     for profile in profiles:
         params = profile.group.as_dict()
@@ -1053,6 +1038,7 @@ def _patch_profiles(
         all_k.extend(profile.k[valid].tolist())
         all_nk.extend(profile.nk[valid].tolist())
         all_err.extend(profile.stderr[valid].tolist())
+        all_combos.extend([combo_key] * int(np.sum(valid)))
 
     if not all_k:
         raise ValueError("No valid points available after applying patch validity ranges.")
@@ -1060,6 +1046,7 @@ def _patch_profiles(
     k_arr = np.asarray(all_k, dtype=float)
     nk_arr = np.asarray(all_nk, dtype=float)
     err_arr = np.asarray(all_err, dtype=float)
+    combo_arr = np.asarray(all_combos, dtype=object)
 
     log_min = np.log10(np.min(k_arr))
     log_max = np.log10(np.max(k_arr))
@@ -1067,11 +1054,14 @@ def _patch_profiles(
     edges = np.logspace(log_min, log_max, num_bins + 1)
     centers = np.sqrt(edges[:-1] * edges[1:])
 
-    bin_ids = np.digitize(k_arr, edges) - 1
+    # np.digitize assigns a point exactly on the upper edge to one past the
+    # final bin; retain it in the final bin instead of dropping it.
+    bin_ids = np.minimum(np.digitize(k_arr, edges) - 1, num_bins - 1)
     valid_bins = (bin_ids >= 0) & (bin_ids < num_bins)
     bin_ids = bin_ids[valid_bins]
     nk_arr = nk_arr[valid_bins]
     err_arr = err_arr[valid_bins]
+    combo_arr = combo_arr[valid_bins]
 
     out_k: List[float] = []
     out_nk: List[float] = []
@@ -1082,27 +1072,53 @@ def _patch_profiles(
         in_bin = bin_ids == bin_idx
         if not np.any(in_bin):
             continue
-        nk_vals = nk_arr[in_bin]
-        err_vals = err_arr[in_bin]
+        # First reduce every (ToF, detuning) combination to one estimate, then
+        # combine those estimates at the second stage.
+        combo_means: List[float] = []
+        combo_errors: List[float] = []
+        for combo_key in np.unique(combo_arr[in_bin]):
+            from_combo = in_bin & (combo_arr == combo_key)
+            combo_nk = nk_arr[from_combo]
+            combo_err = err_arr[from_combo]
+            positive_error = combo_err > 0
+            if np.any(positive_error):
+                combo_weights = 1.0 / np.square(combo_err[positive_error])
+                combo_means.append(
+                    float(
+                        np.sum(combo_weights * combo_nk[positive_error])
+                        / np.sum(combo_weights)
+                    )
+                )
+                combo_errors.append(float(np.sqrt(1.0 / np.sum(combo_weights))))
+            else:
+                combo_means.append(float(np.mean(combo_nk)))
+                combo_errors.append(
+                    float(np.std(combo_nk, ddof=1) / np.sqrt(combo_nk.size))
+                    if combo_nk.size > 1
+                    else 0.0
+                )
 
-        strictly_positive_err = err_vals > 0
-        if np.any(strictly_positive_err):
-            weights = np.zeros_like(err_vals)
-            weights[strictly_positive_err] = 1.0 / np.square(err_vals[strictly_positive_err])
-            weighted_mean = np.sum(weights * nk_vals) / np.sum(weights)
-            combined_err = np.sqrt(1.0 / np.sum(weights))
+        combo_means_arr = np.asarray(combo_means)
+        combo_errors_arr = np.asarray(combo_errors)
+        positive_combo_error = combo_errors_arr > 0
+        if np.any(positive_combo_error):
+            weights = 1.0 / np.square(combo_errors_arr[positive_combo_error])
+            weighted_mean = float(
+                np.sum(weights * combo_means_arr[positive_combo_error]) / np.sum(weights)
+            )
+            combined_err = float(np.sqrt(1.0 / np.sum(weights)))
         else:
-            weighted_mean = float(np.mean(nk_vals))
+            weighted_mean = float(np.mean(combo_means_arr))
             combined_err = (
-                float(np.std(nk_vals, ddof=1) / np.sqrt(nk_vals.size))
-                if nk_vals.size > 1
+                float(np.std(combo_means_arr, ddof=1) / np.sqrt(combo_means_arr.size))
+                if combo_means_arr.size > 1
                 else 0.0
             )
 
         out_k.append(float(centers[bin_idx]))
         out_nk.append(float(weighted_mean))
         out_err.append(float(combined_err))
-        out_count.append(int(nk_vals.size))
+        out_count.append(int(np.sum(in_bin)))
 
     return (
         np.array(out_k, dtype=float),

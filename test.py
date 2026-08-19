@@ -1,4 +1,4 @@
-from momentumPipeline import MomentumDistributionPipeline
+from momentumPipeline import MomentumDistributionPipeline, run_full_pipeline
 from runParameters import RunParameters
 
 # Example: image numbers present in your dataset
@@ -20,6 +20,17 @@ run_params = RunParameters(
     operators=operators,
     values=values,
 )
+
+run_full_pipeline(run_parameters=run_params,
+                data_directory="/Volumes/amopzh/ZH_Shared/BEC 3/Analysis/Projects/GPEB/Processing/2026-08-18/profiles",
+                data_suffix="2026-08-18_S10a", 
+                output_directory="./output", 
+                sort_parameter="waittime", 
+                detuning_parameter="detuning", 
+                tof_parameter="ToF", 
+                non_detuned_value=12
+                )
+'''
 pipeline = MomentumDistributionPipeline(
     data_directory="/Volumes/amopzh/ZH_Shared/BEC 3/Analysis/Projects/GPEB/Processing/2026-08-18/profiles",
     data_suffix="2026-08-18_S10a",
@@ -34,5 +45,6 @@ pipeline = MomentumDistributionPipeline(
 pipeline.remove_bad_images()
 pipeline.compute_averaged_momentum_distributions()
 pipeline.rescale_detuned_images()
-#pipeline.select_patch_validity_ranges()
-#pipeline.patch_tofs_and_detunings()
+pipeline.select_patch_validity_ranges()
+pipeline.patch_tofs_and_detunings()
+'''
