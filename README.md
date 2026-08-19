@@ -61,9 +61,12 @@ After completion, `output_directory` will contain:
 - `blanks.json`
 - `averaged_profiles/`
 - `detuning_rescale_factors.json`
-- `rescaled_profiles/`
 - `patch_validity_ranges.json`
 - `final_profiles/`
+
+Rescaled profiles are retained in memory for patching but are not saved separately:
+they are fully reproducible by applying `detuning_rescale_factors.json` to the
+matching files in `averaged_profiles/`.
 
 ## Step-by-step (non-wrapper) usage
 
@@ -89,6 +92,36 @@ pipeline.rescale_detuned_images()
 pipeline.select_patch_validity_ranges()
 pipeline.patch_tofs_and_detunings()
 ```
+
+## Reusing completed stages
+
+Pass any saved JSON result back to the pipeline to skip its corresponding GUI.
+The remaining stages run normally, so the final profiles can be regenerated from
+the saved analysis choices.
+
+```python
+pipeline = MomentumDistributionPipeline(
+    data_directory="/absolute/path/to/profiles",
+    data_suffix="2026-02-16_SFridayRelaxData",
+    run_parameters=run_params,
+    output_directory="/absolute/path/to/new-output",
+    detuning_parameter="detuning",
+    tof_parameter="ToF",
+    blanks_json="/previous-output/blanks.json",
+    detuning_rescale_factors_json="/previous-output/detuning_rescale_factors.json",
+    patch_validity_ranges_json="/previous-output/patch_validity_ranges.json",
+)
+
+# These calls use the supplied files, without opening a GUI for those stages.
+pipeline.remove_bad_images()
+pipeline.compute_averaged_momentum_distributions()
+pipeline.rescale_detuned_images()
+pipeline.select_patch_validity_ranges()
+pipeline.patch_tofs_and_detunings()
+```
+
+Each JSON argument is optional. For example, pass only `blanks_json` to reuse
+image choices while choosing new detuning factors and patch ranges.
 
 ## Notes
 

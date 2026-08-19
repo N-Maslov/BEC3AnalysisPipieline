@@ -47,6 +47,14 @@ def _to_python_scalar(value: Any) -> Any:
     return value
 
 
+def _load_json_file(path: str, description: str) -> Any:
+    """Load a user-supplied pipeline result with a helpful error message."""
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Could not load {description} JSON file '{path}': {exc}") from exc
+
+
 def _ensure_numeric_array(val: Any) -> np.ndarray:
     """Ensure val is a 1D numpy array of floats.
 
@@ -1117,6 +1125,9 @@ class MomentumDistributionPipeline:
         tof_parameter: str = "ToF",
         non_detuned_value: Any = 12,
         two_d: bool = False,
+        blanks_json: Optional[str] = None,
+        detuning_rescale_factors_json: Optional[str] = None,
+        patch_validity_ranges_json: Optional[str] = None,
     ):
         self.output_directory = Path(output_directory)
         self.output_directory.mkdir(parents=True, exist_ok=True)
@@ -1137,8 +1148,47 @@ class MomentumDistributionPipeline:
         self.averaged_profiles: List[AveragedProfile] = []
         self.rescaled_profiles: List[AveragedProfile] = []
         self.patch_ranges: Dict[str, Tuple[float, float]] = {}
+        self.blanks_json = blanks_json
+        self.detuning_rescale_factors_json = detuning_rescale_factors_json
+        self.patch_validity_ranges_json = patch_validity_ranges_json
+        self.detuning_scale_factors: Optional[Dict[str, float]] = None
+
+        if blanks_json is not None:
+            blanks_payload = _load_json_file(blanks_json, "blanks")
+            blank_numbers = blanks_payload.get("blank_image_numbers") if isinstance(blanks_payload, dict) else None
+            if not isinstance(blank_numbers, list):
+                raise ValueError("Blanks JSON must contain a 'blank_image_numbers' list.")
+            self.blanks = sorted({int(image_number) for image_number in blank_numbers})
+
+        if detuning_rescale_factors_json is not None:
+            factors_payload = _load_json_file(
+                detuning_rescale_factors_json,
+                "detuning rescale factors",
+            )
+            if not isinstance(factors_payload, dict):
+                raise ValueError("Detuning-rescale JSON must contain a mapping of detuning values to scale factors.")
+            self.detuning_scale_factors = {
+                str(detuning): float(factor)
+                for detuning, factor in factors_payload.items()
+            }
+
+        if patch_validity_ranges_json is not None:
+            ranges_payload = _load_json_file(patch_validity_ranges_json, "patch validity ranges")
+            if not isinstance(ranges_payload, dict):
+                raise ValueError("Patch-ranges JSON must contain a mapping of combinations to k ranges.")
+            try:
+                self.patch_ranges = {
+                    str(combo_key): (float(values["k_min"]), float(values["k_max"]))
+                    for combo_key, values in ranges_payload.items()
+                }
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "Each patch range must contain numeric 'k_min' and 'k_max' values."
+                ) from exc
 
     def remove_bad_images(self) -> List[int]:
+        if self.blanks_json is not None:
+            return list(self.blanks)
         gui = BadImageSelectionGUI(
             image_processing=self.image_processing,
             groups=self.groups,
@@ -1195,18 +1245,19 @@ class MomentumDistributionPipeline:
         if not self.averaged_profiles:
             raise ValueError("No averaged profiles. Run compute_averaged_momentum_distributions() first.")
 
-        rescale_dir = self.output_directory / "rescaled_profiles"
-        rescale_gui = DetuningRescaleGUI(
-            averaged_profiles=self.averaged_profiles,
-            detuning_parameter=self.detuning_parameter,
-            non_detuned_value=self.non_detuned_value,
-            output_dir=self.output_directory,
-            sort_parameter=self.sort_parameter,
-        )
-        detuning_scale_factors = rescale_gui.launch()
+        if self.detuning_scale_factors is None:
+            rescale_gui = DetuningRescaleGUI(
+                averaged_profiles=self.averaged_profiles,
+                detuning_parameter=self.detuning_parameter,
+                non_detuned_value=self.non_detuned_value,
+                output_dir=self.output_directory,
+                sort_parameter=self.sort_parameter,
+            )
+            detuning_scale_factors: Dict[Any, float] = rescale_gui.launch()
+        else:
+            detuning_scale_factors = self.detuning_scale_factors
 
         rescaled_profiles: List[AveragedProfile] = []
-        manifest = []
         for profile in self.averaged_profiles:
             detuning_value = profile.group.as_dict().get(self.detuning_parameter)
             factor = float(
@@ -1225,30 +1276,15 @@ class MomentumDistributionPipeline:
                 scale_factor=factor,
             )
             rescaled_profiles.append(scaled_profile)
-            file_name = f"{profile.group.key}.csv"
-            _write_profile_csv(
-                rescale_dir / file_name,
-                scaled_profile.k,
-                scaled_profile.nk,
-                scaled_profile.stderr,
-                scaled_profile.n_shots_per_point,
-            )
-            manifest.append(
-                {
-                    "group": profile.group.as_dict(),
-                    "group_key": profile.group.key,
-                    "scale_factor": factor,
-                    "file": file_name,
-                }
-            )
 
-        (rescale_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
         self.rescaled_profiles = rescaled_profiles
         return rescaled_profiles
 
     def select_patch_validity_ranges(self) -> Dict[str, Tuple[float, float]]:
         if not self.rescaled_profiles:
             raise ValueError("No rescaled profiles. Run rescale_detuned_images() first.")
+        if self.patch_validity_ranges_json is not None:
+            return dict(self.patch_ranges)
         patch_sets = _group_for_patching(
             self.rescaled_profiles,
             tof_parameter=self.tof_parameter,
@@ -1311,6 +1347,9 @@ def run_full_pipeline(
     tof_parameter: str = "ToF",
     non_detuned_value: Any = 12,
     two_d: bool = False,
+    blanks_json: Optional[str] = None,
+    detuning_rescale_factors_json: Optional[str] = None,
+    patch_validity_ranges_json: Optional[str] = None,
 ) -> MomentumDistributionPipeline:
     pipeline = MomentumDistributionPipeline(
         data_directory=data_directory,
@@ -1322,6 +1361,9 @@ def run_full_pipeline(
         tof_parameter=tof_parameter,
         non_detuned_value=non_detuned_value,
         two_d=two_d,
+        blanks_json=blanks_json,
+        detuning_rescale_factors_json=detuning_rescale_factors_json,
+        patch_validity_ranges_json=patch_validity_ranges_json,
     )
     pipeline.remove_bad_images()
     pipeline.compute_averaged_momentum_distributions()
