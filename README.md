@@ -54,9 +54,22 @@ pipeline = run_full_pipeline(
     detuning_parameter="detuning",
     tof_parameter="ToF",
     non_detuned_value=12,         # default non-detuned value
+    detuning_activation_times={-55: 300},  # use -55 data only at waittime >= 300
     two_d=False,                  # set True for k2d/nk2d input files
 )
 ```
+
+`detuning_activation_times` is optional and maps each detuning to the earliest
+time at which it should contribute. The time parameter defaults to `"waittime"`
+when available (otherwise `sort_parameter`); override it with
+`activation_time_parameter` when your time variable has another name.
+Detunings omitted from the mapping activate at the lowest scheduled time. Before
+a detuning activates, it is excluded from final patched profiles. Once an
+activated detuned profile has the same non-detuning parameters as a reference
+profile, that non-detuned profile is excluded from the final result instead.
+All data remain visible in the bad-image, rescaling, and validity-range GUIs;
+series excluded from the final result are labelled accordingly. Averaged profile
+files are retained for every parameter combination.
 
 After completion, `output_directory` will contain:
 

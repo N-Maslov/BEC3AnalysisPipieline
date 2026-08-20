@@ -39,6 +39,7 @@ class AveragedProfile:
     stderr: np.ndarray
     n_shots_per_point: np.ndarray
     scale_factor: float = 1.0
+    included_in_final: bool = True
 
 
 def _to_python_scalar(value: Any) -> Any:
@@ -223,10 +224,12 @@ class BadImageSelectionGUI:
         image_processing: ImageProcessing,
         groups: Sequence[ParameterGroup],
         output_dir: Path,
+        excluded_from_final_group_keys: Optional[Iterable[str]] = None,
     ):
         self.image_processing = image_processing
         self.groups = list(groups)
         self.output_dir = output_dir
+        self.excluded_from_final_group_keys = set(excluded_from_final_group_keys or ())
 
         self.group_idx = 0
         self.manual_blanks: set[int] = set()
@@ -372,9 +375,14 @@ class BadImageSelectionGUI:
         self.ax_energy.plot(x_values, e_values, color="0.6", alpha=0.4)
 
         title = ", ".join(f"{k}={v}" for k, v in params.items())
+        final_status = (
+            "Excluded from final patching"
+            if group.key in self.excluded_from_final_group_keys
+            else "Included in final patching"
+        )
         self.fig.suptitle(
             f"Group {self.group_idx + 1}/{len(self.groups)} | {title}\n"
-            f"Effective blanks in this group: {sum(i in group_blanks for i in group.run_numbers)}",
+            f"{final_status} | Effective blanks in this group: {sum(i in group_blanks for i in group.run_numbers)}",
             fontsize=11,
         )
         self.fig.canvas.draw_idle()
@@ -645,7 +653,10 @@ class DetuningRescaleGUI:
         # set colors explicitly to avoid duplicate colors
         ref_color = "tab:blue"
         det_color = "tab:orange"
-        self.ax.loglog(reference.k, reference.nk, "o-", ms=3, label="Non-detuned reference", color=ref_color)
+        reference_label = "Non-detuned reference"
+        if not reference.included_in_final:
+            reference_label += " (excluded from final)"
+        self.ax.loglog(reference.k, reference.nk, "o-", ms=3, label=reference_label, color=ref_color)
         # fill reference errors if available
         try:
             if reference.stderr is not None and np.any(np.isfinite(reference.stderr)):
@@ -653,7 +664,10 @@ class DetuningRescaleGUI:
                 self.ax.fill_between(reference.k, reference.nk - ref_err, reference.nk + ref_err, color=ref_color, alpha=0.15)
         except Exception:
             pass
-        self.ax.loglog(detuned.k, scaled_nk, "o-", ms=3, label="Detuned (scaled)", color=det_color)
+        detuned_label = "Detuned (scaled)"
+        if not detuned.included_in_final:
+            detuned_label += " (excluded from final)"
+        self.ax.loglog(detuned.k, scaled_nk, "o-", ms=3, label=detuned_label, color=det_color)
         self.ax.fill_between(detuned.k, scaled_nk - scaled_err, scaled_nk + scaled_err, color=det_color, alpha=0.2)
 
         # initialize default axis limits if not set
@@ -949,14 +963,17 @@ class PatchRangesGUI:
             zorder = 3 if combo_key == self.selected_combo else 2
             in_valid_range = (profile.k >= low) & (profile.k <= high)
             if np.any(in_valid_range):
+                included_in_final = profile.included_in_final
+                label = combo_key if included_in_final else f"{combo_key} (excluded from final)"
                 self.ax.loglog(
                     profile.k[in_valid_range],
                     profile.nk[in_valid_range],
-                    ".-",
+                    ".-" if included_in_final else ".--",
                     linewidth=linewidth,
-                    label=combo_key,
+                    label=label,
                     color=self.combo_colors[combo_key],
                     zorder=zorder,
+                    alpha=1.0 if included_in_final else 0.35,
                 )
 
         other_text = ", ".join(f"{k}={v}" for k, v in other_params)
@@ -1154,6 +1171,8 @@ class MomentumDistributionPipeline:
         detuning_parameter: str = "detuning",
         tof_parameter: str = "ToF",
         non_detuned_value: Any = 12,
+        detuning_activation_times: Optional[Dict[Any, float]] = None,
+        activation_time_parameter: Optional[str] = None,
         two_d: bool = False,
         blanks_json: Optional[str] = None,
         detuning_rescale_factors_json: Optional[str] = None,
@@ -1165,6 +1184,10 @@ class MomentumDistributionPipeline:
         self.tof_parameter = tof_parameter
         self.non_detuned_value = non_detuned_value
         self.sort_parameter = sort_parameter
+        self.activation_time_parameter = activation_time_parameter
+        self.detuning_activation_times = self._validate_activation_times(
+            detuning_activation_times
+        )
 
         self.image_processing = ImageProcessing(data_directory, data_suffix, twoD=two_d)
         self.run_parameters = run_parameters
@@ -1173,6 +1196,18 @@ class MomentumDistributionPipeline:
             run_numbers=self.image_processing.inums,
             sort_parameter=sort_parameter,
         )
+        if self.activation_time_parameter is None:
+            self.activation_time_parameter = (
+                "waittime"
+                if "waittime" in self.run_parameters.variable_names
+                else sort_parameter or "waittime"
+            )
+        self.default_detuning_activation_time = self._lowest_activation_time()
+        # Retained for callers that inspect the pipeline state.  All groups are
+        # shown and processed; this list identifies groups used in final patches.
+        self.active_groups = [
+            group for group in self.groups if self._group_is_active(group)
+        ]
 
         self.blanks: List[int] = []
         self.averaged_profiles: List[AveragedProfile] = []
@@ -1216,6 +1251,88 @@ class MomentumDistributionPipeline:
                     "Each patch range must contain numeric 'k_min' and 'k_max' values."
                 ) from exc
 
+    @staticmethod
+    def _validate_activation_times(
+        activation_times: Optional[Dict[Any, float]],
+    ) -> Dict[Any, float]:
+        if activation_times is None:
+            return {}
+        if not isinstance(activation_times, dict):
+            raise ValueError("detuning_activation_times must be a mapping of detunings to times.")
+        try:
+            return {
+                detuning: float(activation_time)
+                for detuning, activation_time in activation_times.items()
+            }
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Every detuning activation time must be numeric.") from exc
+
+    def _lowest_activation_time(self) -> Optional[float]:
+        """Return the earliest scheduled time, if this dataset has a time parameter."""
+        time_values = []
+        for group in self.groups:
+            value = group.as_dict().get(self.activation_time_parameter)
+            if value is None:
+                continue
+            try:
+                time_values.append(float(value))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Activation time parameter '{self.activation_time_parameter}' must be numeric."
+                ) from exc
+        if not time_values:
+            if self.detuning_activation_times:
+                raise ValueError(
+                    f"Activation time parameter '{self.activation_time_parameter}' was not found in the run parameters."
+                )
+            return None
+        return min(time_values)
+
+    def _activation_time_for_detuning(self, detuning_value: Any) -> Optional[float]:
+        """Get a detuning's requested activation time, defaulting to the earliest time."""
+        for configured_detuning, activation_time in self.detuning_activation_times.items():
+            if configured_detuning == detuning_value or str(configured_detuning) == str(detuning_value):
+                return activation_time
+        return self.default_detuning_activation_time
+
+    def _detuned_group_is_active(self, group: ParameterGroup) -> bool:
+        """Whether a detuned group has reached its activation time."""
+        params = group.as_dict()
+        activation_time = self._activation_time_for_detuning(
+            params.get(self.detuning_parameter)
+        )
+        # No time parameter is needed when no activation cutoffs were requested.
+        if activation_time is None:
+            return True
+        try:
+            group_time = float(params[self.activation_time_parameter])
+        except KeyError as exc:
+            raise ValueError(
+                f"Activation time parameter '{self.activation_time_parameter}' was not found in a parameter group."
+            ) from exc
+        return group_time >= activation_time
+
+    def _matching_detuned_group_is_active(self, group: ParameterGroup) -> bool:
+        """Whether an active detuned counterpart replaces this reference group."""
+        reference_params = group.as_dict()
+        for candidate in self.groups:
+            candidate_params = candidate.as_dict()
+            if candidate_params.get(self.detuning_parameter) == self.non_detuned_value:
+                continue
+            if all(
+                candidate_params.get(name) == value
+                for name, value in reference_params.items()
+                if name != self.detuning_parameter
+            ) and self._detuned_group_is_active(candidate):
+                return True
+        return False
+
+    def _group_is_active(self, group: ParameterGroup) -> bool:
+        """Whether a group contributes to a final patched momentum profile."""
+        if group.as_dict().get(self.detuning_parameter) != self.non_detuned_value:
+            return self._detuned_group_is_active(group)
+        return not self._matching_detuned_group_is_active(group)
+
     def remove_bad_images(self) -> List[int]:
         if self.blanks_json is not None:
             return list(self.blanks)
@@ -1223,6 +1340,9 @@ class MomentumDistributionPipeline:
             image_processing=self.image_processing,
             groups=self.groups,
             output_dir=self.output_directory,
+            excluded_from_final_group_keys={
+                group.key for group in self.groups if not self._group_is_active(group)
+            },
         )
         self.blanks = gui.launch()
         return self.blanks
@@ -1253,6 +1373,7 @@ class MomentumDistributionPipeline:
                 nk=nk_vals,
                 stderr=stderr_vals,
                 n_shots_per_point=n_counts,
+                included_in_final=self._group_is_active(group),
             )
             averaged_profiles.append(averaged_profile)
 
@@ -1363,6 +1484,7 @@ class MomentumDistributionPipeline:
                 stderr=np.copy(profile.stderr) * factor,
                 n_shots_per_point=np.copy(profile.n_shots_per_point),
                 scale_factor=factor,
+                included_in_final=profile.included_in_final,
             )
             rescaled_profiles.append(scaled_profile)
 
@@ -1404,8 +1526,11 @@ class MomentumDistributionPipeline:
         manifest = []
 
         for other_params, profiles in patch_sets:
+            final_profiles = [profile for profile in profiles if profile.included_in_final]
+            if not final_profiles:
+                continue
             k_vals, nk_vals, stderr_vals, n_counts = _patch_profiles(
-                profiles=profiles,
+                profiles=final_profiles,
                 validity_ranges=self.patch_ranges,
                 tof_parameter=self.tof_parameter,
                 detuning_parameter=self.detuning_parameter,
@@ -1417,7 +1542,7 @@ class MomentumDistributionPipeline:
                 {
                     "other_parameters": dict(other_params),
                     "file": file_name,
-                    "components": [profile.group.as_dict() for profile in profiles],
+                    "components": [profile.group.as_dict() for profile in final_profiles],
                 }
             )
 
@@ -1435,6 +1560,8 @@ def run_full_pipeline(
     detuning_parameter: str = "detuning",
     tof_parameter: str = "ToF",
     non_detuned_value: Any = 12,
+    detuning_activation_times: Optional[Dict[Any, float]] = None,
+    activation_time_parameter: Optional[str] = None,
     two_d: bool = False,
     blanks_json: Optional[str] = None,
     detuning_rescale_factors_json: Optional[str] = None,
@@ -1449,6 +1576,8 @@ def run_full_pipeline(
         detuning_parameter=detuning_parameter,
         tof_parameter=tof_parameter,
         non_detuned_value=non_detuned_value,
+        detuning_activation_times=detuning_activation_times,
+        activation_time_parameter=activation_time_parameter,
         two_d=two_d,
         blanks_json=blanks_json,
         detuning_rescale_factors_json=detuning_rescale_factors_json,
