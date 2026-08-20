@@ -244,6 +244,9 @@ class BadImageSelectionGUI:
         self.k_range: Optional[Tuple[float, float]] = None
         self.log_nk_y_range: Optional[Tuple[float, float]] = None
         self.linear_nk_y_range: Optional[Tuple[float, float]] = None
+        all_run_numbers = [inum for group in self.groups for inum in group.run_numbers]
+        self.max_image_number = max(all_run_numbers)
+        self.min_image_number = min(all_run_numbers) - 1
 
         # Give the controls their own left-hand column, keeping the full figure
         # height available to the 2×2 plot grid.
@@ -310,8 +313,16 @@ class BadImageSelectionGUI:
             valinit=3.0,
             valstep=0.1,
         )
+        self.max_image_slider = Slider(
+            control_axes(0.05, 0.68, 0.90, 0.040),
+            "Max image",
+            self.min_image_number,
+            self.max_image_number,
+            valinit=self.max_image_number,
+            valstep=1,
+        )
 
-        self.range_panel = control_axes(0.02, 0.24, 0.96, 0.46)
+        self.range_panel = control_axes(0.02, 0.21, 0.96, 0.43)
         self.range_panel.set_facecolor("0.96")
         self.range_panel.set_xticks([])
         self.range_panel.set_yticks([])
@@ -339,14 +350,14 @@ class BadImageSelectionGUI:
         self.k_min_box, self.k_max_box = range_row("k", 0.55)
         self.log_nk_y_min_box, self.log_nk_y_max_box = range_row("log n(k)", 0.465)
         self.linear_nk_y_min_box, self.linear_nk_y_max_box = range_row("linear n(k)", 0.38)
-        self.btn_apply_plot_ranges = Button(control_axes(0.05, 0.275, 0.42, 0.045), "Apply ranges")
-        self.btn_reset_plot_ranges = Button(control_axes(0.53, 0.275, 0.42, 0.045), "Reset ranges")
+        self.btn_apply_plot_ranges = Button(control_axes(0.05, 0.245, 0.42, 0.045), "Apply ranges")
+        self.btn_reset_plot_ranges = Button(control_axes(0.53, 0.245, 0.42, 0.045), "Reset ranges")
 
-        self.btn_prev = Button(control_axes(0.05, 0.18, 0.42, 0.050), "Previous")
-        self.btn_next = Button(control_axes(0.53, 0.18, 0.42, 0.050), "Next")
-        self.btn_reset_group = Button(control_axes(0.05, 0.12, 0.90, 0.045), "Unblank group")
-        self.btn_reset_all = Button(control_axes(0.05, 0.065, 0.90, 0.045), "Reset all")
-        self.btn_save = Button(control_axes(0.05, 0.01, 0.90, 0.045), "Save and close")
+        self.btn_prev = Button(control_axes(0.05, 0.15, 0.42, 0.045), "Previous")
+        self.btn_next = Button(control_axes(0.53, 0.15, 0.42, 0.045), "Next")
+        self.btn_reset_group = Button(control_axes(0.05, 0.095, 0.90, 0.040), "Unblank group")
+        self.btn_reset_all = Button(control_axes(0.05, 0.050, 0.90, 0.035), "Reset all")
+        self.btn_save = Button(control_axes(0.05, 0.010, 0.90, 0.035), "Save and close")
         for button in (self.btn_apply_plot_ranges, self.btn_reset_plot_ranges):
             button.label.set_fontsize(7)
         for button in (
@@ -360,6 +371,7 @@ class BadImageSelectionGUI:
 
         self.low_sigma_slider.on_changed(self._on_sigma_changed)
         self.high_sigma_slider.on_changed(self._on_sigma_changed)
+        self.max_image_slider.on_changed(self._on_max_image_changed)
         self.btn_apply_plot_ranges.on_clicked(self._apply_plot_ranges)
         self.btn_reset_plot_ranges.on_clicked(self._reset_plot_ranges)
         self.btn_prev.on_clicked(self._prev_group)
@@ -377,13 +389,26 @@ class BadImageSelectionGUI:
 
     def _effective_blanks(self) -> List[int]:
         auto_blanks = set().union(*self.sigma_blanks_by_group.values())
-        return sorted(self.manual_blanks | (auto_blanks - self.manual_includes))
+        return sorted(
+            self.manual_blanks
+            | (auto_blanks - self.manual_includes)
+            | self._cutoff_blanks()
+        )
+
+    def _cutoff_blanks(self) -> set[int]:
+        """Images after the global image-number cutoff are always blanked."""
+        return {
+            inum
+            for group in self.groups
+            for inum in group.run_numbers
+            if inum > self.max_image_number
+        }
 
     def _effective_group_blanks(self, group: ParameterGroup) -> set[int]:
         """Return exclusions for a group after manual overrides are applied."""
         return self.manual_blanks | (
             self.sigma_blanks_by_group[group.key] - self.manual_includes
-        )
+        ) | self._cutoff_blanks()
 
     def _calc_sigma_blanks(self, group: ParameterGroup, low_sigma: float, high_sigma: float) -> set[int]:
         n_values: List[float] = []
@@ -527,6 +552,8 @@ class BadImageSelectionGUI:
             inum = self.artist_to_inum.get(artist)
         if inum is None:
             return
+        if inum in self._cutoff_blanks():
+            return
         auto_blanks = set().union(*self.sigma_blanks_by_group.values())
         if inum in self._effective_blanks():
             self.manual_blanks.discard(inum)
@@ -543,6 +570,10 @@ class BadImageSelectionGUI:
             float(self.high_sigma_slider.val),
         )
         self._recalculate_sigma_blanks()
+        self._refresh_plot()
+
+    def _on_max_image_changed(self, value: float) -> None:
+        self.max_image_number = int(round(value))
         self._refresh_plot()
 
     @staticmethod
@@ -625,6 +656,10 @@ class BadImageSelectionGUI:
     def _reset_all(self, _: Any) -> None:
         self.manual_blanks.clear()
         self.manual_includes.clear()
+        self.max_image_number = max(
+            inum for group in self.groups for inum in group.run_numbers
+        )
+        self.max_image_slider.set_val(self.max_image_number)
         self.sigma_thresholds = (3.0, 3.0)
         self.low_sigma_slider.set_val(3.0)
         self.high_sigma_slider.set_val(3.0)
@@ -638,6 +673,7 @@ class BadImageSelectionGUI:
             "blank_image_numbers": self._effective_blanks(),
             "manual_blanks": sorted(self.manual_blanks),
             "manual_includes": sorted(self.manual_includes),
+            "max_image_number": self.max_image_number,
             "sigma_thresholds": {
                 "lower_sigma": self.sigma_thresholds[0],
                 "upper_sigma": self.sigma_thresholds[1],
