@@ -1,4 +1,4 @@
-from momentumPipeline import MomentumDistributionPipeline, run_full_pipeline
+from momentumPipeline import run_full_pipeline
 from runParameters import RunParameters
 
 # Example: image numbers present in your dataset

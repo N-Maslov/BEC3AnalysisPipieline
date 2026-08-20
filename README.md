@@ -12,6 +12,8 @@ The interactive pipeline is implemented in [momentumPipeline.py](/Users/nmasl/De
 
 1. **Remove bad images** with a matplotlib GUI (manual clicking + sigma-based outlier blanking).
 2. **Average momentum distributions** over remaining shots per parameter group, with standard error.
+   This also writes `averaged_ds_<suffix>.txt`: one row per parameter combination,
+   with mean and standard-error columns for every non-`ImageNumber` ds field.
 3. **Rescale detuned data** against non-detuned references using a GUI.
 4. **Patch TOFs/detunings** into final single momentum distributions using user-selected validity ranges.
 
@@ -60,6 +62,7 @@ After completion, `output_directory` will contain:
 
 - `blanks.json`
 - `averaged_profiles/`
+- `averaged_ds_<suffix>.txt`
 - `detuning_rescale_factors.json`
 - `patch_validity_ranges.json`
 - `final_profiles/`

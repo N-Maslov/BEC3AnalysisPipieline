@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 class ImageProcessing:
     """
@@ -215,10 +215,10 @@ class ImageProcessing:
         k_arr = _parse_value(k_values)
         nk_arr = _parse_value(nk_values)
 
-        # Locate the row in calc_data whose ImageNumber matches inum.
-        # Use integer comparison to avoid issues if genfromtxt produced floats.
-        image_numbers = np.array(self.calc_data["ImageNumber"], dtype=int)
-        matches = np.nonzero(image_numbers == inum)[0]
+        # Locate the row in calc_data whose ImageNumber matches inum.  Keep
+        # malformed rows with a missing ImageNumber out of the comparison.
+        image_numbers = np.asarray(self.calc_data["ImageNumber"], dtype=float)
+        matches = np.nonzero(np.isfinite(image_numbers) & (image_numbers == inum))[0]
         if matches.size == 0:
             raise IndexError(f"Image number {inum} out of range")
 

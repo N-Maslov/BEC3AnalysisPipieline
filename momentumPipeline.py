@@ -203,6 +203,20 @@ def _write_profile_csv(
             writer.writerow(row)
 
 
+def _mean_and_stderr(values: Sequence[Any]) -> Tuple[float, float]:
+    """Return the finite-value mean and sample standard error for a ds column."""
+    numeric_values = np.asarray(values, dtype=float)
+    numeric_values = numeric_values[np.isfinite(numeric_values)]
+    if numeric_values.size == 0:
+        return float("nan"), float("nan")
+    if numeric_values.size == 1:
+        return float(numeric_values[0]), 0.0
+    return (
+        float(np.mean(numeric_values)),
+        float(np.std(numeric_values, ddof=1) / np.sqrt(numeric_values.size)),
+    )
+
+
 class BadImageSelectionGUI:
     def __init__(
         self,
@@ -1214,6 +1228,7 @@ class MomentumDistributionPipeline:
         return self.blanks
 
     def compute_averaged_momentum_distributions(self) -> List[AveragedProfile]:
+        self.write_averaged_ds()
         averaged_dir = self.output_directory / "averaged_profiles"
         averaged_dir.mkdir(parents=True, exist_ok=True)
         manifest = []
@@ -1256,6 +1271,64 @@ class MomentumDistributionPipeline:
         (averaged_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
         self.averaged_profiles = averaged_profiles
         return averaged_profiles
+
+    def write_averaged_ds(self) -> Path:
+        """Write ds metadata averaged over each non-blank parameter combination.
+
+        The output replaces the per-shot ``ImageNumber`` index with the ordered
+        parameter columns from ``RunParameters``.  Each remaining source ds
+        column is represented by paired ``_mean`` and ``_stderr`` columns.
+        Standard errors use the sample standard deviation (``ddof=1``) and are
+        zero for a combination containing one valid shot.
+        """
+        calc_data = self.image_processing.calc_data
+        field_names = list(calc_data.dtype.names or ())
+        if "ImageNumber" not in field_names:
+            raise ValueError("The ds file must contain an 'ImageNumber' column.")
+
+        value_fields = [name for name in field_names if name != "ImageNumber"]
+        parameter_fields = list(self.run_parameters.variable_names)
+        output_path = self.output_directory / f"averaged_ds_{self.image_processing.suffix}.txt"
+        blank_set = set(self.blanks)
+
+        # Index ds rows by image number so the grouping established from the
+        # parameter schedule can be applied even if ds rows are not ordered.
+        row_by_image_number = {}
+        for ds_row in np.atleast_1d(calc_data):
+            try:
+                image_number = float(ds_row["ImageNumber"])
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(image_number):
+                continue
+            row_by_image_number[int(image_number)] = ds_row
+
+        header = parameter_fields + [
+            column_name
+            for field_name in value_fields
+            for column_name in (f"{field_name}_mean", f"{field_name}_stderr")
+        ]
+        with output_path.open("w", newline="") as file:
+            writer = csv.writer(file, delimiter="\t")
+            writer.writerow(header)
+            for group in self.groups:
+                valid_rows = [
+                    row_by_image_number[image_number]
+                    for image_number in group.run_numbers
+                    if image_number not in blank_set and image_number in row_by_image_number
+                ]
+                if not valid_rows:
+                    continue
+
+                row = [group.as_dict()[name] for name in parameter_fields]
+                for field_name in value_fields:
+                    mean, stderr = _mean_and_stderr(
+                        [ds_row[field_name] for ds_row in valid_rows]
+                    )
+                    row.extend((mean, stderr))
+                writer.writerow(row)
+
+        return output_path
 
     def rescale_detuned_images(self) -> List[AveragedProfile]:
         if not self.averaged_profiles:
