@@ -233,39 +233,135 @@ class BadImageSelectionGUI:
 
         self.group_idx = 0
         self.manual_blanks: set[int] = set()
+        # A manual include takes precedence over a sigma-based exclusion.  Keep
+        # this separately from manual_blanks so clicking an auto-blanked shot
+        # can restore it without changing the current sigma thresholds.
+        self.manual_includes: set[int] = set()
         self.sigma_thresholds: Tuple[float, float] = (3.0, 3.0)
         self.sigma_blanks_by_group: Dict[str, set[int]] = {group.key: set() for group in self.groups}
         self.artist_to_inum: Dict[Any, int] = {}
+        self.final_status_text: Optional[Any] = None
+        self.k_range: Optional[Tuple[float, float]] = None
+        self.log_nk_y_range: Optional[Tuple[float, float]] = None
+        self.linear_nk_y_range: Optional[Tuple[float, float]] = None
 
-        self.fig, self.axes = plt.subplots(1, 3, figsize=(18, 8))
-        self.fig.subplots_adjust(bottom=0.30, top=0.84, wspace=0.32)
-        self.ax_profiles, self.ax_n, self.ax_energy = self.axes
+        # Give the controls their own left-hand column, keeping the full figure
+        # height available to the 2×2 plot grid.
+        self.fig = plt.figure(figsize=(20, 10))
+        grid = self.fig.add_gridspec(
+            2,
+            3,
+            left=0.07,
+            right=0.97,
+            bottom=0.10,
+            top=0.78,
+            width_ratios=(0.50, 1, 1),
+            wspace=0.38,
+            hspace=0.42,
+        )
+        self.axes = [
+            self.fig.add_subplot(grid[0, 1]),
+            self.fig.add_subplot(grid[0, 2]),
+            self.fig.add_subplot(grid[1, 1]),
+            self.fig.add_subplot(grid[1, 2]),
+        ]
+        self.ax_profiles, self.ax_linear_nk, self.ax_n, self.ax_energy = self.axes
+
+        controls = grid[:, 0].get_position(self.fig)
+        control_left, control_bottom = controls.x0, controls.y0
+        control_width, control_height = controls.width, controls.height
+
+        def control_axes(
+            x_fraction: float,
+            y_fraction: float,
+            width_fraction: float,
+            height_fraction: float,
+        ) -> Any:
+            return self.fig.add_axes([
+                control_left + x_fraction * control_width,
+                control_bottom + y_fraction * control_height,
+                width_fraction * control_width,
+                height_fraction * control_height,
+            ])
+
+        self.fig.text(
+            control_left + control_width / 2,
+            control_bottom + 0.93 * control_height,
+            "Controls",
+            ha="center",
+            va="center",
+            fontsize=13,
+            fontweight="bold",
+        )
 
         self.low_sigma_slider = Slider(
-            self.fig.add_axes([0.12, 0.19, 0.32, 0.035]),
-            "Global lower σ",
+            control_axes(0.05, 0.83, 0.90, 0.040),
+            "Lower σ",
             0.0,
             6.0,
             valinit=3.0,
             valstep=0.1,
         )
         self.high_sigma_slider = Slider(
-            self.fig.add_axes([0.12, 0.12, 0.32, 0.035]),
-            "Global upper σ",
+            control_axes(0.05, 0.75, 0.90, 0.040),
+            "Upper σ",
             0.0,
             6.0,
             valinit=3.0,
             valstep=0.1,
         )
 
-        self.btn_prev = Button(self.fig.add_axes([0.52, 0.17, 0.09, 0.06]), "Previous")
-        self.btn_next = Button(self.fig.add_axes([0.63, 0.17, 0.09, 0.06]), "Next")
-        self.btn_reset_group = Button(self.fig.add_axes([0.74, 0.17, 0.18, 0.06]), "Unblank group")
-        self.btn_reset_all = Button(self.fig.add_axes([0.52, 0.07, 0.18, 0.06]), "Reset all")
-        self.btn_save = Button(self.fig.add_axes([0.72, 0.07, 0.20, 0.06]), "Save and close")
+        self.range_panel = control_axes(0.02, 0.24, 0.96, 0.46)
+        self.range_panel.set_facecolor("0.96")
+        self.range_panel.set_xticks([])
+        self.range_panel.set_yticks([])
+        self.range_panel.set_title("Momentum plot ranges", fontsize=8, pad=4)
+        self.fig.text(control_left + 0.545 * control_width, control_bottom + 0.625 * control_height, "Min", ha="center", va="center", fontsize=7)
+        self.fig.text(control_left + 0.825 * control_width, control_bottom + 0.625 * control_height, "Max", ha="center", va="center", fontsize=7)
+
+        def range_row(label: str, y_fraction: float) -> Tuple[TextBox, TextBox]:
+            self.fig.text(
+                control_left + 0.06 * control_width,
+                control_bottom + y_fraction * control_height,
+                label,
+                ha="left",
+                va="center",
+                fontsize=7,
+            )
+            boxes = (
+                TextBox(control_axes(0.42, y_fraction - 0.0275, 0.25, 0.055), "", initial="auto"),
+                TextBox(control_axes(0.70, y_fraction - 0.0275, 0.25, 0.055), "", initial="auto"),
+            )
+            for box in boxes:
+                box.text_disp.set_fontsize(8)
+            return boxes
+
+        self.k_min_box, self.k_max_box = range_row("k", 0.55)
+        self.log_nk_y_min_box, self.log_nk_y_max_box = range_row("log n(k)", 0.465)
+        self.linear_nk_y_min_box, self.linear_nk_y_max_box = range_row("linear n(k)", 0.38)
+        self.btn_apply_plot_ranges = Button(control_axes(0.05, 0.275, 0.42, 0.045), "Apply ranges")
+        self.btn_reset_plot_ranges = Button(control_axes(0.53, 0.275, 0.42, 0.045), "Reset ranges")
+
+        self.btn_prev = Button(control_axes(0.05, 0.18, 0.42, 0.050), "Previous")
+        self.btn_next = Button(control_axes(0.53, 0.18, 0.42, 0.050), "Next")
+        self.btn_reset_group = Button(control_axes(0.05, 0.12, 0.90, 0.045), "Unblank group")
+        self.btn_reset_all = Button(control_axes(0.05, 0.065, 0.90, 0.045), "Reset all")
+        self.btn_save = Button(control_axes(0.05, 0.01, 0.90, 0.045), "Save and close")
+        for button in (self.btn_apply_plot_ranges, self.btn_reset_plot_ranges):
+            button.label.set_fontsize(7)
+        for button in (
+            self.btn_prev,
+            self.btn_next,
+            self.btn_reset_group,
+            self.btn_reset_all,
+            self.btn_save,
+        ):
+            button.label.set_fontsize(8)
 
         self.low_sigma_slider.on_changed(self._on_sigma_changed)
         self.high_sigma_slider.on_changed(self._on_sigma_changed)
+        self.btn_apply_plot_ranges.on_clicked(self._apply_plot_ranges)
+        self.btn_reset_plot_ranges.on_clicked(self._reset_plot_ranges)
         self.btn_prev.on_clicked(self._prev_group)
         self.btn_next.on_clicked(self._next_group)
         self.btn_reset_group.on_clicked(self._reset_group)
@@ -281,7 +377,13 @@ class BadImageSelectionGUI:
 
     def _effective_blanks(self) -> List[int]:
         auto_blanks = set().union(*self.sigma_blanks_by_group.values())
-        return sorted(self.manual_blanks | auto_blanks)
+        return sorted(self.manual_blanks | (auto_blanks - self.manual_includes))
+
+    def _effective_group_blanks(self, group: ParameterGroup) -> set[int]:
+        """Return exclusions for a group after manual overrides are applied."""
+        return self.manual_blanks | (
+            self.sigma_blanks_by_group[group.key] - self.manual_includes
+        )
 
     def _calc_sigma_blanks(self, group: ParameterGroup, low_sigma: float, high_sigma: float) -> set[int]:
         n_values: List[float] = []
@@ -318,7 +420,7 @@ class BadImageSelectionGUI:
     def _refresh_plot(self) -> None:
         group = self._current_group()
         params = group.as_dict()
-        group_blanks = self.sigma_blanks_by_group[group.key] | self.manual_blanks
+        group_blanks = self._effective_group_blanks(group)
 
         self.artist_to_inum.clear()
         for axis in self.axes:
@@ -329,6 +431,12 @@ class BadImageSelectionGUI:
         self.ax_profiles.set_ylabel("nk")
         self.ax_profiles.set_xscale("log")
         self.ax_profiles.set_yscale("log")
+
+        self.ax_linear_nk.set_title("Individual momentum distributions (linear scale)")
+        self.ax_linear_nk.set_xlabel("k")
+        self.ax_linear_nk.set_ylabel("nk")
+        self.ax_linear_nk.set_xscale("log")
+        self.ax_linear_nk.set_yscale("linear")
 
         self.ax_n.set_title("Atom number N")
         self.ax_n.set_xlabel("Image number")
@@ -356,11 +464,19 @@ class BadImageSelectionGUI:
             n_values.append(n_value)
             e_values.append(e_value)
 
-            valid = np.isfinite(k_vals) & np.isfinite(nk_vals) & (k_vals > 0) & (nk_vals > 0)
+            valid_log = np.isfinite(k_vals) & np.isfinite(nk_vals) & (k_vals > 0) & (nk_vals > 0)
+            valid_linear = np.isfinite(k_vals) & np.isfinite(nk_vals) & (k_vals > 0)
             alpha = 0.2 if inum in group_blanks else 0.9
             profile_line, = self.ax_profiles.plot(
-                k_vals[valid],
-                nk_vals[valid],
+                k_vals[valid_log],
+                nk_vals[valid_log],
+                color=color,
+                alpha=alpha,
+                picker=5,
+            )
+            linear_profile_line, = self.ax_linear_nk.plot(
+                k_vals[valid_linear],
+                nk_vals[valid_linear],
                 color=color,
                 alpha=alpha,
                 picker=5,
@@ -368,23 +484,40 @@ class BadImageSelectionGUI:
             n_point = self.ax_n.scatter([inum], [n_value], color=[color], alpha=alpha, picker=True, s=45)
             e_point = self.ax_energy.scatter([inum], [e_value], color=[color], alpha=alpha, picker=True, s=45)
             self.artist_to_inum[profile_line] = inum
+            self.artist_to_inum[linear_profile_line] = inum
             self.artist_to_inum[n_point] = inum
             self.artist_to_inum[e_point] = inum
 
         self.ax_n.plot(x_values, n_values, color="0.6", alpha=0.4)
         self.ax_energy.plot(x_values, e_values, color="0.6", alpha=0.4)
+        if self.k_range is not None:
+            self.ax_profiles.set_xlim(*self.k_range)
+            self.ax_linear_nk.set_xlim(*self.k_range)
+        if self.log_nk_y_range is not None:
+            self.ax_profiles.set_ylim(*self.log_nk_y_range)
+        if self.linear_nk_y_range is not None:
+            self.ax_linear_nk.set_ylim(*self.linear_nk_y_range)
 
         title = ", ".join(f"{k}={v}" for k, v in params.items())
-        final_status = (
-            "Excluded from final patching"
-            if group.key in self.excluded_from_final_group_keys
-            else "Included in final patching"
-        )
         self.fig.suptitle(
             f"Group {self.group_idx + 1}/{len(self.groups)} | {title}\n"
-            f"{final_status} | Effective blanks in this group: {sum(i in group_blanks for i in group.run_numbers)}",
+            f"Effective blanks in this group: {sum(i in group_blanks for i in group.run_numbers)}",
             fontsize=11,
         )
+        if self.final_status_text is not None:
+            self.final_status_text.remove()
+        self.final_status_text = None
+        if group.key in self.excluded_from_final_group_keys:
+            self.final_status_text = self.fig.text(
+                0.5,
+                0.855,
+                "Not included in final patching",
+                ha="center",
+                va="bottom",
+                fontsize=14,
+                fontweight="bold",
+                color="red",
+            )
         self.fig.canvas.draw_idle()
 
     def _on_pick(self, event: Any) -> None:
@@ -394,10 +527,14 @@ class BadImageSelectionGUI:
             inum = self.artist_to_inum.get(artist)
         if inum is None:
             return
-        if inum in self.manual_blanks:
-            self.manual_blanks.remove(inum)
+        auto_blanks = set().union(*self.sigma_blanks_by_group.values())
+        if inum in self._effective_blanks():
+            self.manual_blanks.discard(inum)
+            if inum in auto_blanks:
+                self.manual_includes.add(inum)
         else:
             self.manual_blanks.add(inum)
+            self.manual_includes.discard(inum)
         self._refresh_plot()
 
     def _on_sigma_changed(self, _: float) -> None:
@@ -406,6 +543,68 @@ class BadImageSelectionGUI:
             float(self.high_sigma_slider.val),
         )
         self._recalculate_sigma_blanks()
+        self._refresh_plot()
+
+    @staticmethod
+    def _range_from_text_boxes(
+        min_box: TextBox,
+        max_box: TextBox,
+        label: str,
+        *,
+        positive: bool,
+    ) -> Optional[Tuple[float, float]]:
+        """Read a range, with ``auto`` in both fields restoring autoscaling."""
+        min_text = min_box.text.strip().lower()
+        max_text = max_box.text.strip().lower()
+        if min_text == max_text == "auto":
+            return None
+        try:
+            lower = float(min_text)
+            upper = float(max_text)
+        except ValueError:
+            raise ValueError(f"Enter both {label} limits, or use auto for both.") from None
+        if upper <= lower:
+            raise ValueError(f"The {label} maximum must be greater than its minimum.")
+        if positive and lower <= 0:
+            raise ValueError(f"The {label} minimum must be positive.")
+        return lower, upper
+
+    def _apply_plot_ranges(self, _: Any) -> None:
+        """Apply all requested momentum-plot axis ranges at once."""
+        try:
+            self.k_range = self._range_from_text_boxes(
+                self.k_min_box, self.k_max_box, "k", positive=True
+            )
+            self.log_nk_y_range = self._range_from_text_boxes(
+                self.log_nk_y_min_box,
+                self.log_nk_y_max_box,
+                "log n(k)",
+                positive=True,
+            )
+            self.linear_nk_y_range = self._range_from_text_boxes(
+                self.linear_nk_y_min_box,
+                self.linear_nk_y_max_box,
+                "linear n(k)",
+                positive=False,
+            )
+        except ValueError as exc:
+            self.range_panel.set_title(str(exc), fontsize=7, color="red", pad=4)
+            self.fig.canvas.draw_idle()
+            return
+        self.range_panel.set_title("Momentum plot ranges", fontsize=8, color="black", pad=4)
+        self._refresh_plot()
+
+    def _reset_plot_ranges(self, _: Any) -> None:
+        self.k_range = None
+        self.log_nk_y_range = None
+        self.linear_nk_y_range = None
+        self.k_min_box.set_val("auto")
+        self.k_max_box.set_val("auto")
+        self.log_nk_y_min_box.set_val("auto")
+        self.log_nk_y_max_box.set_val("auto")
+        self.linear_nk_y_min_box.set_val("auto")
+        self.linear_nk_y_max_box.set_val("auto")
+        self.range_panel.set_title("Momentum plot ranges", fontsize=8, color="black", pad=4)
         self._refresh_plot()
 
     def _prev_group(self, _: Any) -> None:
@@ -419,12 +618,13 @@ class BadImageSelectionGUI:
     def _reset_group(self, _: Any) -> None:
         group = self._current_group()
         for inum in group.run_numbers:
-            if inum in self.manual_blanks:
-                self.manual_blanks.remove(inum)
+            self.manual_blanks.discard(inum)
+            self.manual_includes.discard(inum)
         self._refresh_plot()
 
     def _reset_all(self, _: Any) -> None:
         self.manual_blanks.clear()
+        self.manual_includes.clear()
         self.sigma_thresholds = (3.0, 3.0)
         self.low_sigma_slider.set_val(3.0)
         self.high_sigma_slider.set_val(3.0)
@@ -437,6 +637,7 @@ class BadImageSelectionGUI:
         payload = {
             "blank_image_numbers": self._effective_blanks(),
             "manual_blanks": sorted(self.manual_blanks),
+            "manual_includes": sorted(self.manual_includes),
             "sigma_thresholds": {
                 "lower_sigma": self.sigma_thresholds[0],
                 "upper_sigma": self.sigma_thresholds[1],
