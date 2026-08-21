@@ -3,13 +3,14 @@ import json
 import subprocess
 import sys
 from dataclasses import dataclass
+from math import ceil, sqrt
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.lines import Line2D
-from matplotlib.widgets import Button, RadioButtons, Slider, TextBox
+from matplotlib.widgets import Button, Slider, TextBox
 
 from imageProcessing import ImageProcessing
 from runParameters import RunParameters
@@ -1044,6 +1045,7 @@ class PatchRangesGUI:
         self.detuning_parameter = detuning_parameter
         self.output_dir = output_dir
         self.patch_idx = 0
+        self.save_on_close = True
 
         self.combo_bounds = self._compute_combo_bounds()
         self.validity_ranges: Dict[str, Tuple[float, float]] = dict(self.combo_bounds)
@@ -1064,32 +1066,117 @@ class PatchRangesGUI:
             for index, combo_key in enumerate(self.combo_keys)
         }
         self.selected_combo = self.combo_keys[0] if self.combo_keys else ""
+        self.nk_y_limits: Optional[Tuple[float, float]] = None
+        self.k2nk_y_limits: Optional[Tuple[float, float]] = None
 
-        self.fig, (self.ax, self.ax_k2nk) = plt.subplots(2, 1, figsize=(13, 10))
-        self.fig.subplots_adjust(bottom=0.25, left=0.31, top=0.92, hspace=0.38)
-        self.status_text = self.fig.text(0.34, 0.205, "", color="tab:green")
-        self.combo_selector = RadioButtons(
-            self.fig.add_axes([0.02, 0.25, 0.25, 0.64]),
-            self.combo_keys if self.combo_keys else [""],
+        self.fig, (self.ax, self.ax_k2nk) = plt.subplots(1, 2, figsize=(18, 9))
+        self.fig.subplots_adjust(bottom=0.38, left=0.06, right=0.88, top=0.72, wspace=0.28)
+        self.fig.text(0.06, 0.955, "Select (ToF, detuning)", weight="bold", color="#1f2937")
+        self._build_combo_selector()
+        self.patch_set_title = self.fig.text(0.42, 0.735, "", ha="center", fontsize=14, weight="bold")
+        self.status_text = self.fig.text(0.66, 0.205, "", color="tab:green")
+        self.shared_legend: Optional[Any] = None
+        self.box_radius_um = 21.0
+
+        self.slider_ax_min = self.fig.add_axes([0.06, 0.27, 0.50, 0.025])
+        self.slider_ax_max = self.fig.add_axes([0.06, 0.225, 0.50, 0.025])
+        self.k_min_box = TextBox(self.fig.add_axes([0.59, 0.262, 0.07, 0.04]), "", initial="")
+        self.k_max_box = TextBox(self.fig.add_axes([0.59, 0.217, 0.07, 0.04]), "", initial="")
+        self.fig.text(0.68, 0.280, "or set to", color="#374151")
+        self.fig.text(0.68, 0.235, "or set to", color="#374151")
+        self.k_min_box_radii_box = TextBox(
+            self.fig.add_axes([0.76, 0.262, 0.05, 0.04]), "", initial="3"
         )
-        self.combo_selector.on_clicked(self._on_combo_selected)
-
-        self.slider_ax_min = self.fig.add_axes([0.34, 0.15, 0.56, 0.035])
-        self.slider_ax_max = self.fig.add_axes([0.34, 0.09, 0.56, 0.035])
+        self.k_max_box_radii_box = TextBox(
+            self.fig.add_axes([0.76, 0.217, 0.05, 0.04]), "", initial="7"
+        )
+        self.fig.text(0.82, 0.280, "box radii", color="#374151")
+        self.fig.text(0.82, 0.235, "box radii", color="#374151")
+        self.btn_set_k_min_from_radii = Button(
+            self.fig.add_axes([0.89, 0.262, 0.05, 0.04]), "Set"
+        )
+        self.btn_set_k_max_from_radii = Button(
+            self.fig.add_axes([0.89, 0.217, 0.05, 0.04]), "Set"
+        )
         self.slider_min: Optional[Slider] = None
         self.slider_max: Optional[Slider] = None
+        self.k_min_box.on_submit(self._on_k_min_text_submit)
+        self.k_max_box.on_submit(self._on_k_max_text_submit)
+        self.k_min_box_radii_box.on_submit(self._on_k_min_box_radii_submit)
+        self.k_max_box_radii_box.on_submit(self._on_k_max_box_radii_submit)
+        self.btn_set_k_min_from_radii.on_clicked(self._set_k_min_from_box_radii)
+        self.btn_set_k_max_from_radii.on_clicked(self._set_k_max_from_box_radii)
         self._build_sliders_for_combo(self.selected_combo)
 
-        self.btn_prev = Button(self.fig.add_axes([0.34, 0.02, 0.12, 0.055]), "Previous set")
-        self.btn_next = Button(self.fig.add_axes([0.48, 0.02, 0.12, 0.055]), "Next set")
-        self.btn_load = Button(self.fig.add_axes([0.62, 0.02, 0.13, 0.055]), "Load ranges")
-        self.btn_save = Button(self.fig.add_axes([0.77, 0.02, 0.13, 0.055]), "Save and close")
+        self.fig.text(0.06, 0.20, r"$n_k$ y limits (log)", color="#374151")
+        self.fig.text(0.33, 0.20, r"$k^2 n_k$ y limits (linear)", color="#374151")
+        self.nk_y_min_box = TextBox(self.fig.add_axes([0.06, 0.157, 0.12, 0.03]), "min", initial="auto")
+        self.nk_y_max_box = TextBox(self.fig.add_axes([0.06, 0.117, 0.12, 0.03]), "max", initial="auto")
+        self.k2nk_y_min_box = TextBox(self.fig.add_axes([0.33, 0.157, 0.12, 0.03]), "min", initial="auto")
+        self.k2nk_y_max_box = TextBox(self.fig.add_axes([0.33, 0.117, 0.12, 0.03]), "max", initial="auto")
+        self.btn_apply_y_limits = Button(self.fig.add_axes([0.50, 0.157, 0.12, 0.03]), "Apply y limits")
+        self.btn_auto_y_limits = Button(self.fig.add_axes([0.50, 0.117, 0.12, 0.03]), "Auto y limits")
+        self.fig.text(0.66, 0.175, "Box radius (μm)", color="#374151")
+        self.box_radius_box = TextBox(self.fig.add_axes([0.78, 0.157, 0.08, 0.03]), "", initial="21")
+        self.btn_set_box_radius = Button(self.fig.add_axes([0.88, 0.157, 0.06, 0.03]), "Set")
+        self.box_radius_box.on_submit(self._set_box_radius)
+        self.btn_set_box_radius.on_clicked(self._set_box_radius)
+        self.nk_y_min_box.on_submit(self._apply_y_limits)
+        self.nk_y_max_box.on_submit(self._apply_y_limits)
+        self.k2nk_y_min_box.on_submit(self._apply_y_limits)
+        self.k2nk_y_max_box.on_submit(self._apply_y_limits)
+        self.btn_apply_y_limits.on_clicked(self._apply_y_limits)
+        self.btn_auto_y_limits.on_clicked(self._reset_y_limits)
+        self.fig.canvas.mpl_connect("button_press_event", self._clear_auto_y_limit_field)
+
+        self.btn_prev = Button(self.fig.add_axes([0.06, 0.02, 0.14, 0.045]), "Previous set")
+        self.btn_next = Button(self.fig.add_axes([0.22, 0.02, 0.14, 0.045]), "Next set")
+        self.btn_load = Button(self.fig.add_axes([0.38, 0.02, 0.14, 0.045]), "Load ranges")
+        self.btn_exit = Button(self.fig.add_axes([0.54, 0.02, 0.14, 0.045]), "Exit without saving")
+        self.btn_save = Button(self.fig.add_axes([0.70, 0.02, 0.14, 0.045]), "Save and close")
         self.btn_prev.on_clicked(self._prev_set)
         self.btn_next.on_clicked(self._next_set)
         self.btn_load.on_clicked(self._load_ranges)
+        self.btn_exit.on_clicked(self._exit_without_saving)
         self.btn_save.on_clicked(self._save_and_close)
 
         self._refresh_plot()
+
+    def _build_combo_selector(self) -> None:
+        """Create a compact grid of large buttons for selecting a series."""
+        self.combo_buttons: Dict[str, Button] = {}
+        if not self.combo_keys:
+            return
+
+        columns = min(4, max(1, ceil(sqrt(len(self.combo_keys)))))
+        rows = ceil(len(self.combo_keys) / columns)
+        left, bottom, width, height = 0.06, 0.775, 0.88, 0.15
+        gap_x, gap_y = 0.01, 0.012
+        button_width = (width - gap_x * (columns - 1)) / columns
+        button_height = (height - gap_y * (rows - 1)) / rows
+        for index, combo_key in enumerate(self.combo_keys):
+            row, column = divmod(index, columns)
+            x = left + column * (button_width + gap_x)
+            y = bottom + (rows - 1 - row) * (button_height + gap_y)
+            button = Button(
+                self.fig.add_axes([x, y, button_width, button_height]),
+                combo_key,
+                color="#f1f5f9",
+                hovercolor="#dbeafe",
+            )
+            button.on_clicked(lambda _, key=combo_key: self._on_combo_selected(key))
+            self.combo_buttons[combo_key] = button
+        self._update_combo_button_styles()
+
+    def _update_combo_button_styles(self) -> None:
+        for combo_key, button in self.combo_buttons.items():
+            selected = combo_key == self.selected_combo
+            # Button restores ``color`` after mouse events, so update that
+            # property too; changing only the axes facecolor flashes briefly.
+            button.color = "#1e3a8a" if selected else "#f1f5f9"
+            button.hovercolor = "#1e40af" if selected else "#dbeafe"
+            button.ax.set_facecolor(button.color)
+            button.label.set_color("white" if selected else "#1f2937")
 
     def _compute_combo_bounds(self) -> Dict[str, Tuple[float, float]]:
         bounds: Dict[str, Tuple[float, float]] = {}
@@ -1148,6 +1235,10 @@ class PatchRangesGUI:
             log_high,
             valinit=np.log10(current_high),
         )
+        # The editable fields beside the sliders show the physical k values;
+        # hide Slider's duplicate log-coordinate readout.
+        self.slider_min.valtext.set_visible(False)
+        self.slider_max.valtext.set_visible(False)
         self._update_slider_value_labels()
         self.slider_min.on_changed(self._on_slider_change)
         self.slider_max.on_changed(self._on_slider_change)
@@ -1155,9 +1246,82 @@ class PatchRangesGUI:
     def _update_slider_value_labels(self) -> None:
         """Show physical k values while the slider positions use log10(k)."""
         if self.slider_min is not None:
-            self.slider_min.valtext.set_text(f"{10 ** self.slider_min.val:.3g}")
+            self.k_min_box.set_val(f"{10 ** self.slider_min.val:.6g}")
         if self.slider_max is not None:
-            self.slider_max.valtext.set_text(f"{10 ** self.slider_max.val:.3g}")
+            self.k_max_box.set_val(f"{10 ** self.slider_max.val:.6g}")
+
+    def _set_k_limit_from_text(self, value_text: str, is_minimum: bool) -> None:
+        if self.selected_combo == "" or self.slider_min is None or self.slider_max is None:
+            return
+        try:
+            value = float(value_text)
+        except ValueError:
+            value = float("nan")
+        bound_low, bound_high = self.combo_bounds[self.selected_combo]
+        other_value = float(10 ** (self.slider_max.val if is_minimum else self.slider_min.val))
+        valid_order = value <= other_value if is_minimum else value >= other_value
+        if not np.isfinite(value) or not bound_low <= value <= bound_high or not valid_order:
+            self.status_text.set_text(
+                f"Enter a k value from {bound_low:.6g} to {bound_high:.6g}, without crossing the other limit."
+            )
+            self.status_text.set_color("tab:red")
+            self._update_slider_value_labels()
+            self.fig.canvas.draw_idle()
+            return
+        slider = self.slider_min if is_minimum else self.slider_max
+        slider.set_val(np.log10(value))
+        self.status_text.set_text("")
+
+    def _on_k_min_text_submit(self, value_text: str) -> None:
+        self._set_k_limit_from_text(value_text, is_minimum=True)
+
+    def _on_k_max_text_submit(self, value_text: str) -> None:
+        self._set_k_limit_from_text(value_text, is_minimum=False)
+
+    def _set_box_radius(self, _: Any) -> None:
+        try:
+            box_radius = float(self.box_radius_box.text)
+        except ValueError:
+            box_radius = float("nan")
+        if not np.isfinite(box_radius) or box_radius <= 0:
+            self.status_text.set_text("Box radius must be a positive number of μm.")
+            self.status_text.set_color("tab:red")
+            self.fig.canvas.draw_idle()
+            return
+        self.box_radius_um = box_radius
+        self.box_radius_box.set_val(f"{box_radius:.6g}")
+        self.status_text.set_text(f"Box radius set to {box_radius:.6g} μm.")
+        self.status_text.set_color("tab:green")
+        self.fig.canvas.draw_idle()
+
+    def _set_k_limit_from_box_radii(self, radii_text: str, is_minimum: bool) -> None:
+        if self.selected_combo == "":
+            return
+        try:
+            box_radii = float(radii_text)
+            tof = float(self.combo_values[self.selected_combo][1])
+        except (KeyError, TypeError, ValueError):
+            box_radii = float("nan")
+            tof = float("nan")
+        if not np.isfinite(box_radii) or box_radii <= 0 or not np.isfinite(tof) or tof <= 0:
+            self.status_text.set_text("Box radii and ToF must both be positive numbers.")
+            self.status_text.set_color("tab:red")
+            self.fig.canvas.draw_idle()
+            return
+        k_value = 0.613526 * box_radii * self.box_radius_um / tof
+        self._set_k_limit_from_text(f"{k_value:.16g}", is_minimum)
+
+    def _on_k_min_box_radii_submit(self, radii_text: str) -> None:
+        self._set_k_limit_from_box_radii(radii_text, is_minimum=True)
+
+    def _on_k_max_box_radii_submit(self, radii_text: str) -> None:
+        self._set_k_limit_from_box_radii(radii_text, is_minimum=False)
+
+    def _set_k_min_from_box_radii(self, _: Any) -> None:
+        self._on_k_min_box_radii_submit(self.k_min_box_radii_box.text)
+
+    def _set_k_max_from_box_radii(self, _: Any) -> None:
+        self._on_k_max_box_radii_submit(self.k_max_box_radii_box.text)
 
     def _on_slider_change(self, _: float) -> None:
         if self.selected_combo == "" or self.slider_min is None or self.slider_max is None:
@@ -1166,13 +1330,76 @@ class PatchRangesGUI:
         high = float(10 ** self.slider_max.val)
         if low > high:
             low, high = high, low
+        # Slider positions are stored as log10(k).  Converting an untouched
+        # endpoint back with 10**x can differ from the original k value by a
+        # few floating-point bits, excluding the first/last sample from an
+        # otherwise inclusive range.
+        bound_low, bound_high = self.combo_bounds[self.selected_combo]
+        if np.isclose(low, bound_low, rtol=1e-12, atol=0.0):
+            low = bound_low
+        if np.isclose(high, bound_high, rtol=1e-12, atol=0.0):
+            high = bound_high
         self.validity_ranges[self.selected_combo] = (low, high)
         self._update_slider_value_labels()
         self._refresh_plot()
 
     def _on_combo_selected(self, combo_key: str) -> None:
         self.selected_combo = combo_key
+        self._update_combo_button_styles()
         self._build_sliders_for_combo(combo_key)
+        self._refresh_plot()
+
+    @staticmethod
+    def _read_y_limits(minimum: TextBox, maximum: TextBox, log_scale: bool) -> Optional[Tuple[float, float]]:
+        values = (minimum.text.strip().lower(), maximum.text.strip().lower())
+        if values in (("", ""), ("auto", "auto")):
+            return None
+        if "" in values or "auto" in values:
+            raise ValueError("Enter both limits, or use 'auto' for both.")
+        try:
+            low, high = (float(value) for value in values)
+        except ValueError as exc:
+            raise ValueError("Axis limits must be numeric.") from exc
+        if not np.isfinite(low) or not np.isfinite(high) or low >= high:
+            raise ValueError("Axis limits must be finite, with minimum less than maximum.")
+        if log_scale and low <= 0:
+            raise ValueError("The log-scale n_k plot requires a positive y minimum.")
+        return low, high
+
+    def _apply_y_limits(self, _: Any) -> None:
+        try:
+            self.nk_y_limits = self._read_y_limits(self.nk_y_min_box, self.nk_y_max_box, log_scale=True)
+            self.k2nk_y_limits = self._read_y_limits(self.k2nk_y_min_box, self.k2nk_y_max_box, log_scale=False)
+        except ValueError as exc:
+            self.status_text.set_text(f"Could not apply y limits: {exc}")
+            self.status_text.set_color("tab:red")
+            self.fig.canvas.draw_idle()
+            return
+        self.status_text.set_text("Applied y limits." if self.nk_y_limits or self.k2nk_y_limits else "Using automatic y limits.")
+        self.status_text.set_color("tab:green")
+        self._refresh_plot()
+
+    def _clear_auto_y_limit_field(self, event: Any) -> None:
+        """Let users type over the automatic placeholder without deleting it."""
+        for box in (
+            self.nk_y_min_box,
+            self.nk_y_max_box,
+            self.k2nk_y_min_box,
+            self.k2nk_y_max_box,
+        ):
+            if event.inaxes is box.ax and box.text.strip().lower() == "auto":
+                box.set_val("")
+                return
+
+    def _reset_y_limits(self, _: Any) -> None:
+        self.nk_y_limits = None
+        self.k2nk_y_limits = None
+        self.nk_y_min_box.set_val("auto")
+        self.nk_y_max_box.set_val("auto")
+        self.k2nk_y_min_box.set_val("auto")
+        self.k2nk_y_max_box.set_val("auto")
+        self.status_text.set_text("Using automatic y limits.")
+        self.status_text.set_color("tab:green")
         self._refresh_plot()
 
     def _import_validity_ranges(self, path: str) -> Tuple[int, int]:
@@ -1278,7 +1505,50 @@ class PatchRangesGUI:
     def _current_patch_set(self) -> Tuple[Tuple[Tuple[str, Any], ...], List[AveragedProfile]]:
         return self.patch_sets[self.patch_idx]
 
+    @staticmethod
+    def _auto_log_y_limits(values: Sequence[np.ndarray]) -> Optional[Tuple[float, float]]:
+        """Calculate log-scale limits from data values, deliberately excluding errors."""
+        positive = [array[np.isfinite(array) & (array > 0)] for array in values]
+        positive = [array for array in positive if array.size]
+        if not positive:
+            return None
+        low = float(min(np.min(array) for array in positive))
+        high = float(max(np.max(array) for array in positive))
+        if np.isclose(low, high):
+            return low / 2.0, high * 2.0
+        padding = (high / low) ** 0.06
+        return low / padding, high * padding
+
+    @staticmethod
+    def _auto_linear_y_limits(values: Sequence[np.ndarray]) -> Optional[Tuple[float, float]]:
+        """Calculate linear-scale limits from data values, deliberately excluding errors."""
+        finite = [array[np.isfinite(array)] for array in values]
+        finite = [array for array in finite if array.size]
+        if not finite:
+            return None
+        low = float(min(np.min(array) for array in finite))
+        high = float(max(np.max(array) for array in finite))
+        padding = 0.06 * (high - low)
+        if padding == 0:
+            padding = max(abs(low), 1.0) * 0.06
+        return low - padding, high + padding
+
+    def _apply_y_axis_limits(
+        self,
+        nk_values: Sequence[np.ndarray],
+        k2nk_values: Sequence[np.ndarray],
+    ) -> None:
+        nk_limits = self.nk_y_limits or self._auto_log_y_limits(nk_values)
+        k2nk_limits = self.k2nk_y_limits or self._auto_linear_y_limits(k2nk_values)
+        if nk_limits is not None:
+            self.ax.set_ylim(nk_limits)
+        if k2nk_limits is not None:
+            self.ax_k2nk.set_ylim(k2nk_limits)
+
     def _refresh_plot(self) -> None:
+        if self.shared_legend is not None:
+            self.shared_legend.remove()
+            self.shared_legend = None
         self.ax.clear()
         self.ax_k2nk.clear()
         self.ax.set_xscale("log")
@@ -1289,6 +1559,7 @@ class PatchRangesGUI:
         self.ax_k2nk.set_ylabel(r"$k^2 n_k$ (rescaled)")
 
         if not self.patch_sets:
+            self.patch_set_title.set_text("No data for patching")
             self.ax.text(0.5, 0.5, "No data for patching.", ha="center", va="center")
             self.ax_k2nk.text(0.5, 0.5, "No data for patching.", ha="center", va="center")
             self.fig.canvas.draw_idle()
@@ -1301,6 +1572,9 @@ class PatchRangesGUI:
             profiles,
             key=lambda profile: self._combo_key(profile.group.as_dict()) == self.selected_combo,
         )
+        nk_values: List[np.ndarray] = []
+        k2nk_values: List[np.ndarray] = []
+        excluded_legend_labels: set[str] = set()
         for profile in ordered_profiles:
             params = profile.group.as_dict()
             combo_key = self._combo_key(params)
@@ -1310,22 +1584,36 @@ class PatchRangesGUI:
             in_valid_range = (profile.k >= low) & (profile.k <= high)
             if np.any(in_valid_range):
                 included_in_final = profile.included_in_final
-                label = combo_key if included_in_final else f"{combo_key} (excluded from final)"
-                self.ax.loglog(
-                    profile.k[in_valid_range],
-                    profile.nk[in_valid_range],
-                    ".-" if included_in_final else ".--",
+                label = f"({params[self.tof_parameter]}, {params[self.detuning_parameter]})"
+                if not included_in_final:
+                    excluded_legend_labels.add(label)
+                k_values = profile.k[in_valid_range]
+                nk_values_for_profile = profile.nk[in_valid_range]
+                errors = np.abs(profile.stderr[in_valid_range])
+                k2nk_values_for_profile = k_values ** 2 * nk_values_for_profile
+                nk_values.append(nk_values_for_profile)
+                k2nk_values.append(k2nk_values_for_profile)
+                self.ax.errorbar(
+                    k_values,
+                    nk_values_for_profile,
+                    yerr=errors,
+                    fmt=".-" if included_in_final else ".--",
                     linewidth=linewidth,
+                    elinewidth=max(0.6, linewidth * 0.5),
+                    capsize=2,
                     label=label,
                     color=self.combo_colors[combo_key],
                     zorder=zorder,
                     alpha=1.0 if included_in_final else 0.35,
                 )
-                self.ax_k2nk.plot(
-                    profile.k[in_valid_range],
-                    profile.k[in_valid_range] ** 2 * profile.nk[in_valid_range],
-                    ".-" if included_in_final else ".--",
+                self.ax_k2nk.errorbar(
+                    k_values,
+                    k2nk_values_for_profile,
+                    yerr=k_values ** 2 * errors,
+                    fmt=".-" if included_in_final else ".--",
                     linewidth=linewidth,
+                    elinewidth=max(0.6, linewidth * 0.5),
+                    capsize=2,
                     label=label,
                     color=self.combo_colors[combo_key],
                     zorder=zorder,
@@ -1333,12 +1621,25 @@ class PatchRangesGUI:
                 )
 
         other_text = ", ".join(f"{k}={v}" for k, v in other_params)
-        self.ax.set_title(
-            f"Patch set {self.patch_idx + 1}/{len(self.patch_sets)} | {other_text}"
-        )
-        self.ax.legend(loc="best", fontsize=8)
-        self.ax_k2nk.set_title(r"$k^2 n_k$ (linear axes)")
-        self.ax_k2nk.legend(loc="best", fontsize=8)
+        title = f"Patch set {self.patch_idx + 1}/{len(self.patch_sets)}"
+        if other_text:
+            title += f" | {other_text}"
+        self.patch_set_title.set_text(title)
+        self._apply_y_axis_limits(nk_values, k2nk_values)
+        handles, labels = self.ax.get_legend_handles_labels()
+        if handles:
+            self.shared_legend = self.fig.legend(
+                handles,
+                labels,
+                loc="center left",
+                bbox_to_anchor=(0.89, 0.56),
+                fontsize=8,
+                title="(ToF, detuning)",
+                title_fontsize=8,
+            )
+            for text in self.shared_legend.get_texts():
+                if text.get_text() in excluded_legend_labels:
+                    text.set_color("tab:red")
         self.fig.canvas.draw_idle()
 
     def _prev_set(self, _: Any) -> None:
@@ -1367,9 +1668,14 @@ class PatchRangesGUI:
         self.save()
         plt.close(self.fig)
 
+    def _exit_without_saving(self, _: Any) -> None:
+        self.save_on_close = False
+        plt.close(self.fig)
+
     def launch(self) -> Dict[str, Tuple[float, float]]:
         plt.show()
-        self.save()
+        if self.save_on_close:
+            self.save()
         return dict(self.validity_ranges)
 
 
