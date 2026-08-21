@@ -59,6 +59,48 @@ def _load_json_file(path: str, description: str) -> Any:
         raise ValueError(f"Could not load {description} JSON file '{path}': {exc}") from exc
 
 
+def _choose_json_file(initial_directory: Path, title: str) -> str:
+    """Open a native JSON-file chooser without disturbing Matplotlib's event loop."""
+    if sys.platform == "darwin":
+        def choose_file(default_location: str) -> str:
+            result = subprocess.run(
+                [
+                    "osascript",
+                    "-e",
+                    "POSIX path of (choose file with prompt "
+                    f"{json.dumps(title)} default location "
+                    f"(POSIX file {json.dumps(default_location)}))",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                if "User canceled" in result.stderr:
+                    return ""
+                raise RuntimeError(result.stderr.strip() or "The file picker could not be opened.")
+            return result.stdout.strip()
+
+        try:
+            return choose_file(str(initial_directory.resolve()))
+        except RuntimeError:
+            return choose_file(str(Path.home() / "Documents"))
+
+    from tkinter import Tk, filedialog
+
+    root = Tk()
+    root.withdraw()
+    try:
+        return filedialog.askopenfilename(
+            parent=root,
+            title=title,
+            initialdir=str(initial_directory.resolve()),
+            filetypes=[("JSON files", "*.json"), ("All files", "*")],
+        )
+    finally:
+        root.destroy()
+
+
 def _ensure_numeric_array(val: Any) -> np.ndarray:
     """Ensure val is a 1D numpy array of floats.
 
@@ -232,6 +274,8 @@ class BadImageSelectionGUI:
         self.image_processing = image_processing
         self.groups = list(groups)
         self.output_dir = output_dir
+        self.save_on_close = True
+        self.stop_pipeline = False
         self.excluded_from_final_group_keys = set(excluded_from_final_group_keys or ())
 
         self.group_idx = 0
@@ -257,12 +301,12 @@ class BadImageSelectionGUI:
         grid = self.fig.add_gridspec(
             2,
             3,
-            left=0.07,
+            left=0.04,
             right=0.97,
             bottom=0.10,
             top=0.78,
-            width_ratios=(0.50, 1, 1),
-            wspace=0.38,
+            width_ratios=(1.10, 1, 1),
+            wspace=0.28,
             hspace=0.42,
         )
         self.axes = [
@@ -325,7 +369,7 @@ class BadImageSelectionGUI:
             valstep=1,
         )
 
-        self.range_panel = control_axes(0.02, 0.21, 0.96, 0.43)
+        self.range_panel = control_axes(0.02, 0.215, 0.96, 0.425)
         self.range_panel.set_facecolor("0.96")
         self.range_panel.set_xticks([])
         self.range_panel.set_yticks([])
@@ -356,11 +400,14 @@ class BadImageSelectionGUI:
         self.btn_apply_plot_ranges = Button(control_axes(0.05, 0.245, 0.42, 0.045), "Apply ranges")
         self.btn_reset_plot_ranges = Button(control_axes(0.53, 0.245, 0.42, 0.045), "Reset ranges")
 
-        self.btn_prev = Button(control_axes(0.05, 0.15, 0.42, 0.045), "Previous")
-        self.btn_next = Button(control_axes(0.53, 0.15, 0.42, 0.045), "Next")
-        self.btn_reset_group = Button(control_axes(0.05, 0.095, 0.90, 0.040), "Unblank group")
-        self.btn_reset_all = Button(control_axes(0.05, 0.050, 0.90, 0.035), "Reset all")
-        self.btn_save = Button(control_axes(0.05, 0.010, 0.90, 0.035), "Save and close")
+        self.btn_prev = Button(control_axes(0.02, 0.16, 0.46, 0.040), "Previous")
+        self.btn_next = Button(control_axes(0.52, 0.16, 0.46, 0.040), "Next")
+        self.btn_reset_group = Button(control_axes(0.02, 0.115, 0.96, 0.035), "Unblank group")
+        self.btn_reset_all = Button(control_axes(0.02, 0.075, 0.46, 0.030), "Reset all")
+        self.btn_load = Button(control_axes(0.52, 0.075, 0.46, 0.030), "Load JSON")
+        self.btn_stop = Button(control_axes(0.02, 0.040, 0.96, 0.028), "Stop pipeline")
+        self.btn_exit = Button(control_axes(0.02, 0.005, 0.46, 0.028), "Exit without saving")
+        self.btn_save = Button(control_axes(0.52, 0.005, 0.46, 0.028), "Save and close")
         for button in (self.btn_apply_plot_ranges, self.btn_reset_plot_ranges):
             button.label.set_fontsize(7)
         for button in (
@@ -371,6 +418,9 @@ class BadImageSelectionGUI:
             self.btn_save,
         ):
             button.label.set_fontsize(8)
+        self.btn_load.label.set_fontsize(8)
+        self.btn_exit.label.set_fontsize(7)
+        self.btn_stop.label.set_fontsize(7)
 
         self.low_sigma_slider.on_changed(self._on_sigma_changed)
         self.high_sigma_slider.on_changed(self._on_sigma_changed)
@@ -381,6 +431,9 @@ class BadImageSelectionGUI:
         self.btn_next.on_clicked(self._next_group)
         self.btn_reset_group.on_clicked(self._reset_group)
         self.btn_reset_all.on_clicked(self._reset_all)
+        self.btn_load.on_clicked(self._load_blanks)
+        self.btn_stop.on_clicked(self._stop_pipeline)
+        self.btn_exit.on_clicked(self._exit_without_saving)
         self.btn_save.on_clicked(self._save_and_close)
         self.fig.canvas.mpl_connect("pick_event", self._on_pick)
 
@@ -669,6 +722,60 @@ class BadImageSelectionGUI:
         self._recalculate_sigma_blanks()
         self._refresh_plot()
 
+    @staticmethod
+    def _set_slider_silently(slider: Slider, value: float) -> None:
+        """Update a control while importing JSON without redrawing per field."""
+        eventson = slider.eventson
+        slider.eventson = False
+        try:
+            slider.set_val(value)
+        finally:
+            slider.eventson = eventson
+
+    def _load_blanks(self, _: Any) -> None:
+        try:
+            path = _choose_json_file(self.output_dir, "Load blanks JSON")
+            if not path:
+                return
+            payload = _load_json_file(path, "blanks")
+            if not isinstance(payload, dict):
+                raise ValueError("Blanks JSON must contain an object.")
+            blank_numbers = payload.get("blank_image_numbers")
+            if not isinstance(blank_numbers, list):
+                raise ValueError("Blanks JSON must contain a 'blank_image_numbers' list.")
+
+            known_images = {inum for group in self.groups for inum in group.run_numbers}
+            if "manual_blanks" in payload or "manual_includes" in payload:
+                manual_blanks = payload.get("manual_blanks", [])
+                manual_includes = payload.get("manual_includes", [])
+            else:
+                # Older files record only final blanks; retain those choices as
+                # manual exclusions when no detailed GUI state is available.
+                manual_blanks = blank_numbers
+                manual_includes = []
+            self.manual_blanks = {int(inum) for inum in manual_blanks if int(inum) in known_images}
+            self.manual_includes = {int(inum) for inum in manual_includes if int(inum) in known_images}
+
+            thresholds = payload.get("sigma_thresholds", {})
+            if isinstance(thresholds, dict):
+                low = float(thresholds.get("lower_sigma", self.sigma_thresholds[0]))
+                high = float(thresholds.get("upper_sigma", self.sigma_thresholds[1]))
+                if low < 0 or high < 0:
+                    raise ValueError("Sigma thresholds must be non-negative.")
+                self.sigma_thresholds = (low, high)
+                self._set_slider_silently(self.low_sigma_slider, low)
+                self._set_slider_silently(self.high_sigma_slider, high)
+            max_image = int(payload.get("max_image_number", self.max_image_number))
+            self.max_image_number = int(
+                min(max(max_image, self.max_image_slider.valmin), self.max_image_slider.valmax)
+            )
+            self._set_slider_silently(self.max_image_slider, self.max_image_number)
+            self._recalculate_sigma_blanks()
+            self._refresh_plot()
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            self.range_panel.set_title(f"Could not load JSON: {exc}", fontsize=7, color="red", pad=4)
+            self.fig.canvas.draw_idle()
+
     def save(self) -> Path:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         outpath = self.output_dir / "blanks.json"
@@ -689,9 +796,21 @@ class BadImageSelectionGUI:
         self.save()
         plt.close(self.fig)
 
+    def _exit_without_saving(self, _: Any) -> None:
+        self.save_on_close = False
+        plt.close(self.fig)
+
+    def _stop_pipeline(self, _: Any) -> None:
+        self.save_on_close = False
+        self.stop_pipeline = True
+        plt.close(self.fig)
+
     def launch(self) -> List[int]:
         plt.show()
-        self.save()
+        if self.stop_pipeline:
+            raise SystemExit("Pipeline stopped by user.")
+        if self.save_on_close:
+            self.save()
         return self._effective_blanks()
 
 
@@ -707,6 +826,8 @@ class DetuningRescaleGUI:
         self.detuning_parameter = detuning_parameter
         self.non_detuned_value = non_detuned_value
         self.output_dir = output_dir
+        self.save_on_close = True
+        self.stop_pipeline = False
         self.all_profiles = list(averaged_profiles)
         self.sort_parameter = sort_parameter
 
@@ -723,6 +844,7 @@ class DetuningRescaleGUI:
 
         self.fig, self.ax = plt.subplots(figsize=(12, 8))
         self.fig.subplots_adjust(bottom=0.31, top=0.92)
+        self.status_text = self.fig.text(0.06, 0.275, "", color="tab:green")
         self.ax.set_xscale("log")
         self.ax.set_yscale("log")
         self.ax.set_xlabel("k")
@@ -735,7 +857,8 @@ class DetuningRescaleGUI:
         self.btn_confirm = Button(self.fig.add_axes([0.25, 0.17, 0.18, 0.055]), "Save scale & next")
         self.btn_prev = Button(self.fig.add_axes([0.46, 0.17, 0.10, 0.055]), "Previous")
         self.btn_next = Button(self.fig.add_axes([0.58, 0.17, 0.10, 0.055]), "Next")
-        self.btn_save = Button(self.fig.add_axes([0.72, 0.17, 0.20, 0.055]), "Save and close")
+        self.btn_exit = Button(self.fig.add_axes([0.72, 0.17, 0.10, 0.055]), "Exit w/o save")
+        self.btn_save = Button(self.fig.add_axes([0.83, 0.17, 0.09, 0.055]), "Save and close")
 
         # Put labels above the text boxes so they cannot be clipped by them.
         for x_position, label in ((0.06, "x min"), (0.20, "x max"), (0.34, "y min"), (0.48, "y max")):
@@ -744,17 +867,26 @@ class DetuningRescaleGUI:
         self.xmax_box = TextBox(self.fig.add_axes([0.20, 0.055, 0.12, 0.045]), "")
         self.ymin_box = TextBox(self.fig.add_axes([0.34, 0.055, 0.12, 0.045]), "")
         self.ymax_box = TextBox(self.fig.add_axes([0.48, 0.055, 0.12, 0.045]), "")
-        self.btn_apply_limits = Button(self.fig.add_axes([0.63, 0.055, 0.13, 0.045]), "Apply limits")
-        self.btn_reset_limits = Button(self.fig.add_axes([0.78, 0.055, 0.14, 0.045]), "Reset limits")
+        self.btn_apply_limits = Button(self.fig.add_axes([0.63, 0.055, 0.10, 0.045]), "Apply limits")
+        self.btn_reset_limits = Button(self.fig.add_axes([0.74, 0.055, 0.08, 0.045]), "Reset limits")
+        self.btn_load = Button(self.fig.add_axes([0.83, 0.055, 0.09, 0.045]), "Load JSON")
+        self.btn_stop = Button(self.fig.add_axes([0.72, 0.125, 0.20, 0.03]), "Stop pipeline")
+        self.btn_exit.label.set_fontsize(7)
+        self.btn_save.label.set_fontsize(7)
+        self.btn_load.label.set_fontsize(7)
+        self.btn_stop.label.set_fontsize(7)
 
         # callbacks
         self.btn_confirm.on_clicked(self._confirm_scale)
         self.btn_prev.on_clicked(self._prev_pair)
         self.btn_next.on_clicked(self._next_pair)
+        self.btn_stop.on_clicked(self._stop_pipeline)
+        self.btn_exit.on_clicked(self._exit_without_saving)
         self.btn_save.on_clicked(self._save_and_close)
         self.scale_box.on_submit(lambda txt: self._preview_scale())
         self.btn_apply_limits.on_clicked(self._apply_limits)
         self.btn_reset_limits.on_clicked(self._reset_limits)
+        self.btn_load.on_clicked(self._load_scale_factors)
 
         # initialize default axis limits
         self._default_xlim = None
@@ -861,6 +993,18 @@ class DetuningRescaleGUI:
             return 1.0
         return float(np.median(estimates))
 
+    def _confirmed_scale_for_detuning(self, detuning_value: Any) -> Optional[float]:
+        """Look up a loaded/confirmed factor despite numeric key formatting differences."""
+        if detuning_value in self.confirmed_scales:
+            return float(self.confirmed_scales[detuning_value])
+        for saved_detuning, factor in self.confirmed_scales.items():
+            try:
+                if float(saved_detuning) == float(detuning_value):
+                    return float(factor)
+            except (TypeError, ValueError):
+                continue
+        return None
+
     def _current_pair(self) -> Tuple[AveragedProfile, AveragedProfile]:
         return self.pairs[self.pair_idx]
 
@@ -881,8 +1025,9 @@ class DetuningRescaleGUI:
 
         if not keep_preview:
             # Prefer a saved value for this detuning; otherwise use an estimate.
-            if detuning_value in self.confirmed_scales:
-                self.current_scale = self.confirmed_scales[detuning_value]
+            confirmed_scale = self._confirmed_scale_for_detuning(detuning_value)
+            if confirmed_scale is not None:
+                self.current_scale = confirmed_scale
             else:
                 self.current_scale = self._initial_scale_for_detuning(detuning_value)
             self.scale_box.set_val(f"{self.current_scale:.6g}")
@@ -989,6 +1134,66 @@ class DetuningRescaleGUI:
         self.pair_idx = (self.pair_idx + 1) % len(self.pairs)
         self._refresh_plot()
 
+    def _load_scale_factors(self, _: Any) -> None:
+        try:
+            path = _choose_json_file(self.output_dir, "Load detuning scale factors")
+            if not path:
+                return
+            payload = _load_json_file(path, "detuning rescale factors")
+            if not isinstance(payload, dict):
+                raise ValueError("Scale-factor JSON must contain a mapping of detunings to factors.")
+            loaded = {str(detuning): float(factor) for detuning, factor in payload.items()}
+            if any(not np.isfinite(factor) or factor <= 0 for factor in loaded.values()):
+                raise ValueError("Scale factors must be finite, positive numbers.")
+
+            available_detunings = {
+                profile.group.as_dict().get(self.detuning_parameter)
+                for profile in self.all_profiles
+            }
+            matched_factors: Dict[Any, float] = {}
+            for detuning in available_detunings:
+                if detuning == self.non_detuned_value:
+                    continue
+                factor = loaded.get(str(detuning))
+                if factor is None:
+                    # Saved JSON keys sometimes differ only in numeric display,
+                    # such as -55 versus -55.0.  Match those values by number.
+                    try:
+                        numeric_detuning = float(detuning)
+                        factor = next(
+                            (
+                                candidate_factor
+                                for saved_detuning, candidate_factor in loaded.items()
+                                if float(saved_detuning) == numeric_detuning
+                            ),
+                            None,
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                if factor is not None:
+                    matched_factors[detuning] = factor
+            self.confirmed_scales = matched_factors
+            current_factor: Optional[float] = None
+            if self.pairs:
+                current_detuning = self._current_pair()[0].group.as_dict().get(
+                    self.detuning_parameter
+                )
+                current_factor = self._confirmed_scale_for_detuning(current_detuning)
+                if current_factor is not None:
+                    self.current_scale = current_factor
+                    self.scale_box.set_val(f"{current_factor:.6g}")
+            self._refresh_plot(keep_preview=current_factor is not None)
+            message = f"Loaded {len(matched_factors)} matching detuning scale factor(s)."
+            if current_factor is not None:
+                message += f" Current factor: {current_factor:.6g}."
+            self.status_text.set_text(message)
+            self.status_text.set_color("tab:green")
+            self.fig.canvas.draw_idle()
+        except (OSError, RuntimeError, ValueError) as exc:
+            self.status_text.set_text(f"Could not load JSON: {exc}")
+            self.status_text.set_color("tab:red")
+            self.fig.canvas.draw_idle()
+
     def _detuning_scale_factors(self) -> Dict[Any, float]:
         # Return a mapping detuning_value -> factor, shared across all other parameters.
         factors: Dict[Any, float] = {}
@@ -999,8 +1204,8 @@ class DetuningRescaleGUI:
         for detuning_value in detuning_values:
             if detuning_value == self.non_detuned_value:
                 factor = 1.0
-            elif detuning_value in self.confirmed_scales:
-                factor = float(self.confirmed_scales[detuning_value])
+            elif (confirmed_scale := self._confirmed_scale_for_detuning(detuning_value)) is not None:
+                factor = confirmed_scale
             else:
                 matching = [
                     pair
@@ -1026,10 +1231,23 @@ class DetuningRescaleGUI:
         self.save()
         plt.close(self.fig)
 
+    def _exit_without_saving(self, _: Any) -> None:
+        self.save_on_close = False
+        plt.close(self.fig)
+
+    def _stop_pipeline(self, _: Any) -> None:
+        self.save_on_close = False
+        self.stop_pipeline = True
+        plt.close(self.fig)
+
     def launch(self) -> Dict[Any, float]:
         plt.show()
-        _, factors = self.save()
-        return factors
+        if self.stop_pipeline:
+            raise SystemExit("Pipeline stopped by user.")
+        if self.save_on_close:
+            _, factors = self.save()
+            return factors
+        return self._detuning_scale_factors()
 
 
 class PatchRangesGUI:
@@ -1046,6 +1264,7 @@ class PatchRangesGUI:
         self.output_dir = output_dir
         self.patch_idx = 0
         self.save_on_close = True
+        self.stop_pipeline = False
 
         self.combo_bounds = self._compute_combo_bounds()
         self.validity_ranges: Dict[str, Tuple[float, float]] = dict(self.combo_bounds)
@@ -1129,14 +1348,19 @@ class PatchRangesGUI:
         self.btn_auto_y_limits.on_clicked(self._reset_y_limits)
         self.fig.canvas.mpl_connect("button_press_event", self._clear_auto_y_limit_field)
 
-        self.btn_prev = Button(self.fig.add_axes([0.06, 0.02, 0.14, 0.045]), "Previous set")
-        self.btn_next = Button(self.fig.add_axes([0.22, 0.02, 0.14, 0.045]), "Next set")
-        self.btn_load = Button(self.fig.add_axes([0.38, 0.02, 0.14, 0.045]), "Load ranges")
-        self.btn_exit = Button(self.fig.add_axes([0.54, 0.02, 0.14, 0.045]), "Exit without saving")
-        self.btn_save = Button(self.fig.add_axes([0.70, 0.02, 0.14, 0.045]), "Save and close")
+        self.btn_prev = Button(self.fig.add_axes([0.06, 0.02, 0.12, 0.045]), "Previous set")
+        self.btn_next = Button(self.fig.add_axes([0.20, 0.02, 0.12, 0.045]), "Next set")
+        self.btn_load = Button(self.fig.add_axes([0.34, 0.02, 0.12, 0.045]), "Load ranges")
+        self.btn_stop = Button(self.fig.add_axes([0.48, 0.02, 0.12, 0.045]), "Stop pipeline")
+        self.btn_exit = Button(self.fig.add_axes([0.62, 0.02, 0.12, 0.045]), "Exit w/o saving")
+        self.btn_save = Button(self.fig.add_axes([0.76, 0.02, 0.12, 0.045]), "Save and close")
+        self.btn_stop.label.set_fontsize(7)
+        self.btn_exit.label.set_fontsize(7)
+        self.btn_save.label.set_fontsize(7)
         self.btn_prev.on_clicked(self._prev_set)
         self.btn_next.on_clicked(self._next_set)
         self.btn_load.on_clicked(self._load_ranges)
+        self.btn_stop.on_clicked(self._stop_pipeline)
         self.btn_exit.on_clicked(self._exit_without_saving)
         self.btn_save.on_clicked(self._save_and_close)
 
@@ -1437,47 +1661,7 @@ class PatchRangesGUI:
         return imported, skipped
 
     def _choose_ranges_file(self) -> str:
-        """Open a native file chooser without disturbing Matplotlib's event loop."""
-        if sys.platform == "darwin":
-            def choose_file(default_location: str) -> str:
-                result = subprocess.run(
-                    [
-                        "osascript",
-                        "-e",
-                        "POSIX path of (choose file with prompt "
-                        '"Load patch validity ranges" default location '
-                        f"(POSIX file {json.dumps(default_location)}))",
-                    ],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                )
-                if result.returncode != 0:
-                    if "User canceled" in result.stderr:
-                        return ""
-                    raise RuntimeError(result.stderr.strip() or "The file picker could not be opened.")
-                return result.stdout.strip()
-
-            try:
-                # Do not filter by a Finder type: its JSON UTI recognition can
-                # incorrectly disable valid .json files on some macOS versions.
-                return choose_file(str(self.output_dir.resolve()))
-            except RuntimeError:
-                return choose_file(str(Path.home() / "Documents"))
-
-        from tkinter import Tk, filedialog
-
-        root = Tk()
-        root.withdraw()
-        try:
-            return filedialog.askopenfilename(
-                parent=root,
-                title="Load patch validity ranges",
-                initialdir=str(self.output_dir.resolve()),
-                filetypes=[("JSON files", "*.json"), ("All files", "*")],
-            )
-        finally:
-            root.destroy()
+        return _choose_json_file(self.output_dir, "Load patch validity ranges")
 
     def _load_ranges(self, _: Any) -> None:
         """Choose and import saved ranges without closing the review GUI."""
@@ -1672,8 +1856,15 @@ class PatchRangesGUI:
         self.save_on_close = False
         plt.close(self.fig)
 
+    def _stop_pipeline(self, _: Any) -> None:
+        self.save_on_close = False
+        self.stop_pipeline = True
+        plt.close(self.fig)
+
     def launch(self) -> Dict[str, Tuple[float, float]]:
         plt.show()
+        if self.stop_pipeline:
+            raise SystemExit("Pipeline stopped by user.")
         if self.save_on_close:
             self.save()
         return dict(self.validity_ranges)

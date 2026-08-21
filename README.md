@@ -150,6 +150,46 @@ matching combination ranges from any saved `patch_validity_ranges.json` file.
 Ranges are clipped to the k range available in the current dataset; entries for
 combinations not present in the current dataset are skipped.
 
+## Interactive GUI controls
+
+All three review windows support **Save and close**, which writes that stage's
+JSON result and continues the pipeline; closing the window normally does the
+same. **Exit without saving** continues the pipeline with the current choices
+held in memory, without writing a JSON file. **Stop pipeline** closes without
+saving and ends the current Python run before the next stage starts.
+
+### Bad-image filtering
+
+- **Lower σ** / **Upper σ** set the automatic outlier thresholds for atom
+  number and energy. **Max image** excludes every later image.
+- The **Momentum plot ranges** fields affect only the view. Enter limits and
+  choose **Apply ranges**, or use **Reset ranges** for automatic axes.
+- Click a trace or point to toggle that image's inclusion. **Unblank group**
+  removes manual decisions for the displayed group; **Reset all** restores the
+  initial filtering settings.
+- **Previous** / **Next** switch groups. **Load JSON** imports a saved
+  `blanks.json` for inspection or reuse.
+
+### Detuning rescaling
+
+- Enter a trial factor in **Scale factor** to preview it. **Save scale & next**
+  records that factor for the current detuning and advances to the next pair.
+- **Previous** / **Next** switch comparison pairs. The x/y limit boxes and
+  **Apply limits** control the view; **Reset limits** restores automatic axes.
+- **Load JSON** imports `detuning_rescale_factors.json` values for matching
+  detunings.
+
+### Patch ranges
+
+- The top buttons select the active `(ToF, detuning)` series. Use the k sliders
+  or their numeric fields to choose its validity range.
+- The global **Box radius (μm)** is used by the per-endpoint box-radii controls:
+  `k = 0.613526 × box_radii × box_radius_um / ToF`.
+- The y-limit fields set manual plot limits; **Auto y limits** restores the
+  data-driven defaults. **Previous set** / **Next set** switch non-TOF,
+  non-detuning parameter sets.
+- **Load ranges** imports matching entries from `patch_validity_ranges.json`.
+
 ## Notes
 
 - GUI interaction requires a matplotlib backend that supports windows/events.
