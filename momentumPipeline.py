@@ -1,5 +1,7 @@
 import csv
 import json
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -1063,8 +1065,9 @@ class PatchRangesGUI:
         }
         self.selected_combo = self.combo_keys[0] if self.combo_keys else ""
 
-        self.fig, self.ax = plt.subplots(figsize=(13, 8))
-        self.fig.subplots_adjust(bottom=0.25, left=0.31, top=0.92)
+        self.fig, (self.ax, self.ax_k2nk) = plt.subplots(2, 1, figsize=(13, 10))
+        self.fig.subplots_adjust(bottom=0.25, left=0.31, top=0.92, hspace=0.38)
+        self.status_text = self.fig.text(0.34, 0.205, "", color="tab:green")
         self.combo_selector = RadioButtons(
             self.fig.add_axes([0.02, 0.25, 0.25, 0.64]),
             self.combo_keys if self.combo_keys else [""],
@@ -1077,11 +1080,13 @@ class PatchRangesGUI:
         self.slider_max: Optional[Slider] = None
         self._build_sliders_for_combo(self.selected_combo)
 
-        self.btn_prev = Button(self.fig.add_axes([0.34, 0.02, 0.13, 0.055]), "Previous set")
-        self.btn_next = Button(self.fig.add_axes([0.49, 0.02, 0.13, 0.055]), "Next set")
-        self.btn_save = Button(self.fig.add_axes([0.65, 0.02, 0.25, 0.055]), "Save and close")
+        self.btn_prev = Button(self.fig.add_axes([0.34, 0.02, 0.12, 0.055]), "Previous set")
+        self.btn_next = Button(self.fig.add_axes([0.48, 0.02, 0.12, 0.055]), "Next set")
+        self.btn_load = Button(self.fig.add_axes([0.62, 0.02, 0.13, 0.055]), "Load ranges")
+        self.btn_save = Button(self.fig.add_axes([0.77, 0.02, 0.13, 0.055]), "Save and close")
         self.btn_prev.on_clicked(self._prev_set)
         self.btn_next.on_clicked(self._next_set)
+        self.btn_load.on_clicked(self._load_ranges)
         self.btn_save.on_clicked(self._save_and_close)
 
         self._refresh_plot()
@@ -1170,18 +1175,122 @@ class PatchRangesGUI:
         self._build_sliders_for_combo(combo_key)
         self._refresh_plot()
 
+    def _import_validity_ranges(self, path: str) -> Tuple[int, int]:
+        """Load matching ranges from a saved patch-validity-ranges JSON file."""
+        payload = _load_json_file(path, "patch validity ranges")
+        if not isinstance(payload, dict):
+            raise ValueError("Patch-ranges JSON must contain a mapping of combinations to k ranges.")
+
+        imported = 0
+        skipped = 0
+        for combo_key, values in payload.items():
+            if combo_key not in self.combo_bounds:
+                skipped += 1
+                continue
+            try:
+                range_low = float(values["k_min"])
+                range_high = float(values["k_max"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "Each patch range must contain numeric 'k_min' and 'k_max' values."
+                ) from exc
+            if not np.isfinite(range_low) or not np.isfinite(range_high) or range_low <= 0 or range_high <= 0:
+                raise ValueError("Patch range limits must be finite, strictly positive numbers.")
+            if range_low > range_high:
+                raise ValueError("Each patch range's k_min must be less than or equal to k_max.")
+
+            available_low, available_high = self.combo_bounds[combo_key]
+            range_low = max(range_low, available_low)
+            range_high = min(range_high, available_high)
+            if range_low > range_high:
+                skipped += 1
+                continue
+            self.validity_ranges[combo_key] = (range_low, range_high)
+            imported += 1
+        return imported, skipped
+
+    def _choose_ranges_file(self) -> str:
+        """Open a native file chooser without disturbing Matplotlib's event loop."""
+        if sys.platform == "darwin":
+            def choose_file(default_location: str) -> str:
+                result = subprocess.run(
+                    [
+                        "osascript",
+                        "-e",
+                        "POSIX path of (choose file with prompt "
+                        '"Load patch validity ranges" default location '
+                        f"(POSIX file {json.dumps(default_location)}))",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode != 0:
+                    if "User canceled" in result.stderr:
+                        return ""
+                    raise RuntimeError(result.stderr.strip() or "The file picker could not be opened.")
+                return result.stdout.strip()
+
+            try:
+                # Do not filter by a Finder type: its JSON UTI recognition can
+                # incorrectly disable valid .json files on some macOS versions.
+                return choose_file(str(self.output_dir.resolve()))
+            except RuntimeError:
+                return choose_file(str(Path.home() / "Documents"))
+
+        from tkinter import Tk, filedialog
+
+        root = Tk()
+        root.withdraw()
+        try:
+            return filedialog.askopenfilename(
+                parent=root,
+                title="Load patch validity ranges",
+                initialdir=str(self.output_dir.resolve()),
+                filetypes=[("JSON files", "*.json"), ("All files", "*")],
+            )
+        finally:
+            root.destroy()
+
+    def _load_ranges(self, _: Any) -> None:
+        """Choose and import saved ranges without closing the review GUI."""
+        try:
+            path = self._choose_ranges_file()
+            if not path:
+                return
+
+            imported, skipped = self._import_validity_ranges(path)
+        except (OSError, RuntimeError, ValueError) as exc:
+            self.status_text.set_text(f"Could not load ranges: {exc}")
+            self.status_text.set_color("tab:red")
+            self.fig.canvas.draw_idle()
+            return
+
+        self._build_sliders_for_combo(self.selected_combo)
+        self._refresh_plot()
+        message = f"Loaded {imported} range{'s' if imported != 1 else ''}."
+        if skipped:
+            message += f" Skipped {skipped} unmatched or out-of-range entr{'ies' if skipped != 1 else 'y'}."
+        self.status_text.set_text(message)
+        self.status_text.set_color("tab:green")
+        self.fig.canvas.draw_idle()
+
     def _current_patch_set(self) -> Tuple[Tuple[Tuple[str, Any], ...], List[AveragedProfile]]:
         return self.patch_sets[self.patch_idx]
 
     def _refresh_plot(self) -> None:
         self.ax.clear()
+        self.ax_k2nk.clear()
         self.ax.set_xscale("log")
         self.ax.set_yscale("log")
         self.ax.set_xlabel("k")
         self.ax.set_ylabel("nk (rescaled)")
+        self.ax_k2nk.set_xlabel("k")
+        self.ax_k2nk.set_ylabel(r"$k^2 n_k$ (rescaled)")
 
         if not self.patch_sets:
             self.ax.text(0.5, 0.5, "No data for patching.", ha="center", va="center")
+            self.ax_k2nk.text(0.5, 0.5, "No data for patching.", ha="center", va="center")
             self.fig.canvas.draw_idle()
             return
 
@@ -1212,12 +1321,24 @@ class PatchRangesGUI:
                     zorder=zorder,
                     alpha=1.0 if included_in_final else 0.35,
                 )
+                self.ax_k2nk.plot(
+                    profile.k[in_valid_range],
+                    profile.k[in_valid_range] ** 2 * profile.nk[in_valid_range],
+                    ".-" if included_in_final else ".--",
+                    linewidth=linewidth,
+                    label=label,
+                    color=self.combo_colors[combo_key],
+                    zorder=zorder,
+                    alpha=1.0 if included_in_final else 0.35,
+                )
 
         other_text = ", ".join(f"{k}={v}" for k, v in other_params)
         self.ax.set_title(
             f"Patch set {self.patch_idx + 1}/{len(self.patch_sets)} | {other_text}"
         )
         self.ax.legend(loc="best", fontsize=8)
+        self.ax_k2nk.set_title(r"$k^2 n_k$ (linear axes)")
+        self.ax_k2nk.legend(loc="best", fontsize=8)
         self.fig.canvas.draw_idle()
 
     def _prev_set(self, _: Any) -> None:

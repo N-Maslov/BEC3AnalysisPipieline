@@ -145,6 +145,11 @@ pipeline.patch_tofs_and_detunings()
 Each JSON argument is optional. For example, pass only `blanks_json` to reuse
 image choices while choosing new detuning factors and patch ranges.
 
+While the patch-range GUI is open, use **Load ranges** to inspect and reuse the
+matching combination ranges from any saved `patch_validity_ranges.json` file.
+Ranges are clipped to the k range available in the current dataset; entries for
+combinations not present in the current dataset are skipped.
+
 ## Notes
 
 - GUI interaction requires a matplotlib backend that supports windows/events.

@@ -38,18 +38,18 @@ class MomentumDistribution:
         self.n0err = nkerr_values[0]
 
     def total_atom_number(self, k_cutoff: Optional[float] = None) -> Tuple[float, float]:
-        """Return the integrated atom number and summed ``nk`` uncertainty.
+        """Return the integrated atom number and its propagated uncertainty.
 
         The atom number is obtained by integrating ``4*pi*k^2*nk`` over the
         finite, positive-k data.  When ``k_cutoff`` lies within the available
         k range, the final trapezoid is clipped at that value; otherwise the
-        complete range is integrated.  The returned uncertainty is the sum of
-        the finite ``nkerr`` values at k points included in the integration.
+        complete range is integrated.  The returned uncertainty is propagated
+        through the trapezoidal integral, assuming independent ``nk`` errors.
         """
         return self._integrate(k_power=2, prefactor=4.0 * np.pi, k_cutoff=k_cutoff)
 
     def total_energy(self, k_cutoff: Optional[float] = None) -> Tuple[float, float]:
-        """Return the integrated energy and summed ``nk`` uncertainty.
+        """Return the integrated energy and its propagated uncertainty.
 
         The energy is obtained by integrating ``2*pi*k^4*nk`` over the finite,
         positive-k data.  ``k_cutoff`` behaves as it does for
@@ -60,7 +60,7 @@ class MomentumDistribution:
     def _integrate(
         self, k_power: int, prefactor: float, k_cutoff: Optional[float]
     ) -> Tuple[float, float]:
-        """Integrate a k-weighted profile and sum included ``nk`` errors."""
+        """Integrate a k-weighted profile and propagate ``nk`` uncertainties."""
         valid = np.isfinite(self.k) & np.isfinite(self.nk) & (self.k > 0)
         k = self.k[valid]
         nk = self.nk[valid]
@@ -84,14 +84,34 @@ class MomentumDistribution:
             if k.size == 0 or k[-1] < k_cutoff:
                 original_k = self.k[valid][order]
                 original_nk = self.nk[valid][order]
+                original_nkerr = self.nkerr[valid][order]
+                upper_index = np.searchsorted(original_k, k_cutoff)
+                lower_index = upper_index - 1
+                fraction = (
+                    (k_cutoff - original_k[lower_index])
+                    / (original_k[upper_index] - original_k[lower_index])
+                )
                 k = np.append(k, k_cutoff)
                 nk = np.append(nk, np.interp(k_cutoff, original_k, original_nk))
+                nkerr = np.append(
+                    nkerr,
+                    np.hypot(
+                        (1.0 - fraction) * original_nkerr[lower_index],
+                        fraction * original_nkerr[upper_index],
+                    ),
+                )
 
         if k.size < 2:
             raise ValueError("At least two finite, positive-k points are required for integration.")
 
         integrand = prefactor * np.power(k, k_power) * nk
-        error = np.sum(nkerr[np.isfinite(nkerr)])
+        trapezoid_weights = np.empty_like(k)
+        trapezoid_weights[0] = (k[1] - k[0]) / 2.0
+        trapezoid_weights[-1] = (k[-1] - k[-2]) / 2.0
+        trapezoid_weights[1:-1] = (k[2:] - k[:-2]) / 2.0
+        integration_weights = prefactor * np.power(k, k_power) * trapezoid_weights
+        finite_errors = np.isfinite(nkerr)
+        error = np.sqrt(np.sum(np.square(integration_weights[finite_errors] * nkerr[finite_errors])))
         return float(np.trapz(integrand, k)), float(error)
 
     def ellsq(self, n0_bar=1500, R=21., L=42., zeta=1.9) -> Tuple[float, float]:
