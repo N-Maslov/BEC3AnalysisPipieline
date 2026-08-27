@@ -48,14 +48,19 @@ class MomentumDistribution:
         """
         return self._integrate(k_power=2, prefactor=4.0 * np.pi, k_cutoff=k_cutoff)
 
-    def total_energy(self, k_cutoff: Optional[float] = None) -> Tuple[float, float]:
+    def total_energy(self, k_cutoff: Optional[float] = None, per_particle: bool = True) -> Tuple[float, float]:
         """Return the integrated energy and its propagated uncertainty.
 
         The energy is obtained by integrating ``2*pi*k^4*nk`` over the finite,
         positive-k data.  ``k_cutoff`` behaves as it does for
         :meth:`total_atom_number`.
         """
-        return self._integrate(k_power=4, prefactor=2.0 * np.pi, k_cutoff=k_cutoff)
+        energy, energy_err = self._integrate(k_power=4, prefactor=2.0 * np.pi * 12.4497, k_cutoff=k_cutoff)
+        if per_particle:
+            N, Nerr = self.total_atom_number(k_cutoff=k_cutoff)
+            energy /= N
+            energy_err = np.sqrt((energy_err / N) ** 2 + (energy * Nerr / N**2) ** 2)
+        return energy, energy_err
 
     def _integrate(
         self, k_power: int, prefactor: float, k_cutoff: Optional[float]

@@ -85,7 +85,7 @@ they are fully reproducible by applying `detuning_rescale_factors.json` to the
 matching files in `averaged_profiles/`.
 
 Final profiles are constructed on logarithmic k bins. Within each bin, each
-`(ToF, detuning)` combination contributes one local log-log estimate at the bin
+Each `(ToF, detuning, ...)` configuration contributes one local log-log estimate at the bin
 centre; those estimates are then inverse-variance weighted together. The final
 CSV therefore uses `n_combinations` for its fourth column rather than
 `n_shots`.
@@ -181,7 +181,9 @@ saving and ends the current Python run before the next stage starts.
 
 ### Patch ranges
 
-- The top buttons select the active `(ToF, detuning)` series. Use the k sliders
+- The top buttons select the active `(ToF, detuning, ...)` configuration. Any
+  non-swept experimental parameters (for example `ZeroaV`) are included, so a
+  calibration setting has independent validity limits. Use the k sliders
   or their numeric fields to choose its validity range.
 - The global **Box radius (μm)** is used by the per-endpoint box-radii controls:
   `k = 0.613526 × box_radii × box_radius_um / ToF`.

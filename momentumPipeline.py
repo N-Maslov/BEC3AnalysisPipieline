@@ -1257,11 +1257,17 @@ class PatchRangesGUI:
         tof_parameter: str,
         detuning_parameter: str,
         output_dir: Path,
+        range_parameters: Sequence[str] = (),
     ):
         self.patch_sets = list(patch_sets)
         self.tof_parameter = tof_parameter
         self.detuning_parameter = detuning_parameter
         self.output_dir = output_dir
+        self.range_parameters = tuple(
+            name
+            for name in range_parameters
+            if name not in (tof_parameter, detuning_parameter)
+        )
         self.patch_idx = 0
         self.save_on_close = True
         self.stop_pipeline = False
@@ -1290,7 +1296,13 @@ class PatchRangesGUI:
 
         self.fig, (self.ax, self.ax_k2nk) = plt.subplots(1, 2, figsize=(18, 9))
         self.fig.subplots_adjust(bottom=0.38, left=0.06, right=0.88, top=0.72, wspace=0.28)
-        self.fig.text(0.06, 0.955, "Select (ToF, detuning)", weight="bold", color="#1f2937")
+        self.fig.text(
+            0.06,
+            0.955,
+            f"Select ({self._range_label()})",
+            weight="bold",
+            color="#1f2937",
+        )
         self._build_combo_selector()
         self.patch_set_title = self.fig.text(0.42, 0.735, "", ha="center", fontsize=14, weight="bold")
         self.status_text = self.fig.text(0.66, 0.205, "", color="tab:green")
@@ -1431,7 +1443,17 @@ class PatchRangesGUI:
             return (1, str(value))
 
     def _combo_key(self, params: Dict[str, Any]) -> str:
-        return f"{self.tof_parameter}={params[self.tof_parameter]}, {self.detuning_parameter}={params[self.detuning_parameter]}"
+        return _patch_range_key(
+            params,
+            tof_parameter=self.tof_parameter,
+            detuning_parameter=self.detuning_parameter,
+            range_parameters=self.range_parameters,
+        )
+
+    def _range_label(self) -> str:
+        return ", ".join(
+            (self.tof_parameter, self.detuning_parameter, *self.range_parameters)
+        )
 
     def _build_sliders_for_combo(self, combo_key: str) -> None:
         self.slider_ax_min.clear()
@@ -1768,7 +1790,7 @@ class PatchRangesGUI:
             in_valid_range = (profile.k >= low) & (profile.k <= high)
             if np.any(in_valid_range):
                 included_in_final = profile.included_in_final
-                label = f"({params[self.tof_parameter]}, {params[self.detuning_parameter]})"
+                label = combo_key
                 if not included_in_final:
                     excluded_legend_labels.add(label)
                 k_values = profile.k[in_valid_range]
@@ -1818,7 +1840,7 @@ class PatchRangesGUI:
                 loc="center left",
                 bbox_to_anchor=(0.89, 0.56),
                 fontsize=8,
-                title="(ToF, detuning)",
+                title=self._range_label(),
                 title_fontsize=8,
             )
             for text in self.shared_legend.get_texts():
@@ -1897,11 +1919,23 @@ def _group_for_patching(
     return out
 
 
+def _patch_range_key(
+    params: Dict[str, Any],
+    tof_parameter: str,
+    detuning_parameter: str,
+    range_parameters: Sequence[str] = (),
+) -> str:
+    """Return the saved-range key for a profile's patching configuration."""
+    names = (tof_parameter, detuning_parameter, *range_parameters)
+    return ", ".join(f"{name}={params[name]}" for name in names)
+
+
 def _patch_profiles(
     profiles: Sequence[AveragedProfile],
     validity_ranges: Dict[str, Tuple[float, float]],
     tof_parameter: str,
     detuning_parameter: str,
+    range_parameters: Sequence[str] = (),
     bins_per_decade: int = 40,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     all_k: List[float] = []
@@ -1911,8 +1945,29 @@ def _patch_profiles(
 
     for profile in profiles:
         params = profile.group.as_dict()
-        combo_key = f"{tof_parameter}={params[tof_parameter]}, {detuning_parameter}={params[detuning_parameter]}"
-        k_low, k_high = validity_ranges[combo_key]
+        combo_key = _patch_range_key(
+            params,
+            tof_parameter=tof_parameter,
+            detuning_parameter=detuning_parameter,
+            range_parameters=range_parameters,
+        )
+        if combo_key in validity_ranges:
+            k_low, k_high = validity_ranges[combo_key]
+        else:
+            # JSON files from before range parameters were added used only
+            # (ToF, detuning).  Keep those reusable when no more-specific
+            # range has been selected yet.
+            legacy_key = _patch_range_key(
+                params,
+                tof_parameter=tof_parameter,
+                detuning_parameter=detuning_parameter,
+            )
+            try:
+                k_low, k_high = validity_ranges[legacy_key]
+            except KeyError as exc:
+                raise KeyError(
+                    f"No patch validity range for '{combo_key}'."
+                ) from exc
         valid = (
             np.isfinite(profile.k)
             & np.isfinite(profile.nk)
@@ -2050,6 +2105,14 @@ class MomentumDistributionPipeline:
             run_parameters=self.run_parameters,
             run_numbers=self.image_processing.inums,
             sort_parameter=sort_parameter,
+        )
+        # A range must distinguish physical configurations such as a
+        # calibration setting, but can be shared across the swept sort axis
+        # (normally waittime).
+        self.patch_range_parameters = tuple(
+            name
+            for name in self.run_parameters.variable_names
+            if name not in (self.tof_parameter, self.detuning_parameter, self.sort_parameter)
         )
         if self.activation_time_parameter is None:
             self.activation_time_parameter = (
@@ -2361,6 +2424,7 @@ class MomentumDistributionPipeline:
             tof_parameter=self.tof_parameter,
             detuning_parameter=self.detuning_parameter,
             output_dir=self.output_directory,
+            range_parameters=self.patch_range_parameters,
         )
         self.patch_ranges = gui.launch()
         return self.patch_ranges
@@ -2389,6 +2453,7 @@ class MomentumDistributionPipeline:
                 validity_ranges=self.patch_ranges,
                 tof_parameter=self.tof_parameter,
                 detuning_parameter=self.detuning_parameter,
+                range_parameters=self.patch_range_parameters,
             )
             key_text = "__".join(f"{k}={str(v).replace('/', '_')}" for k, v in other_params)
             file_name = f"{key_text if key_text else 'all_params'}.csv"
