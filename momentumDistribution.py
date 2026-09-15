@@ -37,27 +37,47 @@ class MomentumDistribution:
         self.n0 = nk_values[0]
         self.n0err = nkerr_values[0]
 
-    def total_atom_number(self, k_cutoff: Optional[float] = None) -> Tuple[float, float]:
+    def total_atom_number(
+        self, k_cutoff: Optional[float] = None, k_lower_bound: Optional[float] = None
+    ) -> Tuple[float, float]:
         """Return the integrated atom number and its propagated uncertainty.
 
         The atom number is obtained by integrating ``4*pi*k^2*nk`` over the
-        finite, positive-k data.  When ``k_cutoff`` lies within the available
-        k range, the final trapezoid is clipped at that value; otherwise the
-        complete range is integrated.  The returned uncertainty is propagated
-        through the trapezoidal integral, assuming independent ``nk`` errors.
+        finite, positive-k data. ``k_lower_bound`` and ``k_cutoff`` optionally
+        clip the integration range at its lower and upper ends, respectively;
+        endpoints within the sampled range are linearly interpolated. The
+        returned uncertainty is propagated through the trapezoidal integral,
+        assuming independent ``nk`` errors.
         """
-        return self._integrate(k_power=2, prefactor=4.0 * np.pi, k_cutoff=k_cutoff)
+        return self._integrate(
+            k_power=2,
+            prefactor=4.0 * np.pi,
+            k_cutoff=k_cutoff,
+            k_lower_bound=k_lower_bound,
+        )
 
-    def total_energy(self, k_cutoff: Optional[float] = None, per_particle: bool = True) -> Tuple[float, float]:
+    def total_energy(
+        self,
+        k_cutoff: Optional[float] = None,
+        per_particle: bool = True,
+        k_lower_bound: Optional[float] = None,
+    ) -> Tuple[float, float]:
         """Return the integrated energy and its propagated uncertainty.
 
         The energy is obtained by integrating ``2*pi*k^4*nk`` over the finite,
-        positive-k data.  ``k_cutoff`` behaves as it does for
-        :meth:`total_atom_number`.
+        positive-k data. ``k_cutoff`` and ``k_lower_bound`` behave as they do
+        for :meth:`total_atom_number`.
         """
-        energy, energy_err = self._integrate(k_power=4, prefactor=2.0 * np.pi * 12.4497, k_cutoff=k_cutoff)
+        energy, energy_err = self._integrate(
+            k_power=4,
+            prefactor=2.0 * np.pi * 12.4497,
+            k_cutoff=k_cutoff,
+            k_lower_bound=k_lower_bound,
+        )
         if per_particle:
-            N, Nerr = self.total_atom_number(k_cutoff=k_cutoff)
+            N, Nerr = self.total_atom_number(
+                k_cutoff=k_cutoff, k_lower_bound=k_lower_bound
+            )
             energy /= N
             energy_err = np.sqrt((energy_err / N) ** 2 + (energy * Nerr / N**2) ** 2)
         return energy, energy_err
@@ -158,6 +178,60 @@ class MomentumDistribution:
         """
         return self._peak_k(k_power=4, max_k=max_k)
 
+    def k_where_nk_drops_below(
+        self, threshold: float = 300.0, start_k: float = 1.0
+    ) -> Optional[float]:
+        """Return the first interpolated downward crossing of ``nk`` below a threshold.
+
+        The profile is linearly interpolated between its finite, sampled
+        momentum values.  Only downward crossings at or above ``start_k`` are
+        considered, which makes it possible to exclude low-momentum noise.
+        ``None`` is returned when no such crossing is covered by the profile.
+        """
+        if not np.isfinite(threshold):
+            raise ValueError("threshold must be finite.")
+        if not np.isfinite(start_k):
+            raise ValueError("start_k must be finite.")
+
+        valid = np.isfinite(self.k) & np.isfinite(self.nk)
+        k = self.k[valid]
+        nk = self.nk[valid]
+        if k.size < 2:
+            raise ValueError("At least two finite k and nk points are required to find a threshold crossing.")
+
+        order = np.argsort(k)
+        k = k[order]
+        nk = nk[order]
+        if np.any(np.diff(k) == 0):
+            raise ValueError("Momentum values must be unique to find a threshold crossing.")
+
+        if start_k > k[-1]:
+            return None
+
+        # Include the profile value at start_k as an interpolated left endpoint
+        # when it lies between sampled momenta, without extrapolating beyond
+        # the available data.
+        first_index = np.searchsorted(k, start_k, side="left")
+        if first_index == 0:
+            search_k = k
+            search_nk = nk
+        elif first_index == k.size:
+            return None
+        elif k[first_index] == start_k:
+            search_k = k[first_index:]
+            search_nk = nk[first_index:]
+        else:
+            search_k = np.concatenate(([start_k], k[first_index:]))
+            search_nk = np.concatenate(([np.interp(start_k, k, nk)], nk[first_index:]))
+
+        for left_k, right_k, left_nk, right_nk in zip(
+            search_k[:-1], search_k[1:], search_nk[:-1], search_nk[1:]
+        ):
+            if left_nk >= threshold and right_nk < threshold:
+                fraction = (threshold - left_nk) / (right_nk - left_nk)
+                return float(left_k + fraction * (right_k - left_k))
+        return None
+
     def _peak_k(self, k_power: int, max_k: Optional[float] = None) -> float:
         """Return the k value at the maximum finite k-weighted occupation."""
         valid = np.isfinite(self.k) & np.isfinite(self.nk)
@@ -212,7 +286,11 @@ class MomentumDistribution:
         return clipped_k, clipped_nk, clipped_nkerr
 
     def _integrate(
-        self, k_power: int, prefactor: float, k_cutoff: Optional[float]
+        self,
+        k_power: int,
+        prefactor: float,
+        k_cutoff: Optional[float],
+        k_lower_bound: Optional[float] = None,
     ) -> Tuple[float, float]:
         """Integrate a k-weighted profile and propagate ``nk`` uncertainties."""
         valid = np.isfinite(self.k) & np.isfinite(self.nk) & (self.k > 0)
@@ -226,6 +304,21 @@ class MomentumDistribution:
         k = k[order]
         nk = nk[order]
         nkerr = nkerr[order]
+        if np.any(np.diff(k) == 0):
+            raise ValueError("Momentum values must be unique for integration.")
+
+        if k_cutoff is not None and (not np.isfinite(k_cutoff) or k_cutoff <= 0):
+            raise ValueError("k_cutoff must be a positive finite value.")
+        if k_lower_bound is not None and (
+            not np.isfinite(k_lower_bound) or k_lower_bound < 0
+        ):
+            raise ValueError("k_lower_bound must be a non-negative finite value.")
+        if (
+            k_cutoff is not None
+            and k_lower_bound is not None
+            and k_lower_bound >= k_cutoff
+        ):
+            raise ValueError("k_lower_bound must be smaller than k_cutoff.")
 
         if k_cutoff is not None and k[-1] > k_cutoff:
             included = k <= k_cutoff
@@ -249,6 +342,40 @@ class MomentumDistribution:
                 nk = np.append(nk, np.interp(k_cutoff, original_k, original_nk))
                 nkerr = np.append(
                     nkerr,
+                    np.hypot(
+                        (1.0 - fraction) * original_nkerr[lower_index],
+                        fraction * original_nkerr[upper_index],
+                    ),
+                )
+
+        if k.size < 2:
+            raise ValueError("At least two finite, positive-k points are required for integration.")
+        if k_lower_bound is not None and k_lower_bound >= k[-1]:
+            return 0.0, 0.0
+
+        if k_lower_bound is not None and k[0] < k_lower_bound:
+            original_k = k
+            original_nk = nk
+            original_nkerr = nkerr
+            included = k >= k_lower_bound
+            k = k[included]
+            nk = nk[included]
+            nkerr = nkerr[included]
+
+            # Include an interpolated endpoint so the integral starts at the
+            # requested lower bound when it lies between sampled momenta.
+            if k.size == 0 or k[0] > k_lower_bound:
+                upper_index = np.searchsorted(original_k, k_lower_bound)
+                lower_index = upper_index - 1
+                fraction = (
+                    (k_lower_bound - original_k[lower_index])
+                    / (original_k[upper_index] - original_k[lower_index])
+                )
+                k = np.insert(k, 0, k_lower_bound)
+                nk = np.insert(nk, 0, np.interp(k_lower_bound, original_k, original_nk))
+                nkerr = np.insert(
+                    nkerr,
+                    0,
                     np.hypot(
                         (1.0 - fraction) * original_nkerr[lower_index],
                         fraction * original_nkerr[upper_index],
