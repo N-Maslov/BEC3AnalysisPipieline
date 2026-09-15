@@ -17,6 +17,92 @@ from runParameters import RunParameters
 
 
 @dataclass(frozen=True)
+class PipelineRun:
+    """One independently scheduled acquisition contributing to a pipeline."""
+
+    data_directory: str
+    data_suffix: str
+    run_parameters: RunParameters
+    name: Optional[str] = None
+
+
+class _CombinedImageProcessing(ImageProcessing):
+    """Expose runs through unique integer shot IDs, preserving source metadata."""
+
+    def __init__(self, runs: Sequence[PipelineRun], two_d: bool):
+        self.suffix = "combined"
+        self._blanks = []
+        self.inums = []
+        self.sources = {}
+        self._shots = {}
+        assignments = {}
+        rows = []
+        fields = []
+        seen_shots = set()
+        names = runs[0].run_parameters.variable_names
+        run_names = [run.name or f"run_{index + 1}" for index, run in enumerate(runs)]
+        if len(set(run_names)) != len(run_names):
+            raise ValueError("PipelineRun names must be unique.")
+        for run in runs:
+            if set(run.run_parameters.variable_names) != set(names):
+                raise ValueError("All runs must declare the same parameter names (values and ordering may differ).")
+
+        for run, run_name in zip(runs, run_names):
+            source = ImageProcessing(run.data_directory, run.data_suffix, twoD=two_d)
+            source_fields = list(source.calc_data.dtype.names or ())
+            fields.extend(field for field in source_fields if field not in fields)
+            row_by_number = {
+                int(row["ImageNumber"]): row
+                for row in np.atleast_1d(source.calc_data)
+                if np.isfinite(row["ImageNumber"])
+            }
+            # Only scheduled shots contribute; keep the schedule intact when
+            # files contain extra images or some scheduled images are missing.
+            for number in sorted(set(source.inums) & set(run.run_parameters.run_numbers)):
+                source_key = (str(Path(run.data_directory).resolve()), run.data_suffix, number)
+                if source_key in seen_shots:
+                    raise ValueError(
+                        f"Image {number} from {run.data_directory} ({run.data_suffix}) "
+                        "is included in more than one run."
+                    )
+                seen_shots.add(source_key)
+                shot_id = len(self.inums) + 1
+                self.inums.append(shot_id)
+                self._shots[shot_id] = (source, number)
+                self.sources[str(shot_id)] = {
+                    "run": run_name,
+                    "data_directory": source_key[0],
+                    "data_suffix": run.data_suffix,
+                    "image_number": number,
+                }
+                assignments[shot_id] = run.run_parameters[number]
+                rows.append((shot_id, row_by_number[number]))
+        self.calc_data = np.full(len(rows), np.nan, dtype=[(field, float) for field in fields])
+        for index, (shot_id, row) in enumerate(rows):
+            for field in row.dtype.names:
+                self.calc_data[field][index] = row[field]
+            self.calc_data["ImageNumber"][index] = shot_id
+        self.run_parameters = RunParameters.from_assignments(names, assignments)
+
+    def __getitem__(self, shot_id: int) -> Dict[str, Any]:
+        source, number = self._shots[shot_id]
+        shot = source[number]
+        calc = shot["calc"].copy()
+        calc["ImageNumber"] = shot_id
+        return {"k": shot["k"], "nk": shot["nk"], "calc": calc}
+
+
+def _validate_blank_sources(payload: Dict[str, Any], image_processing: ImageProcessing) -> None:
+    """Never apply combined numeric IDs to a different set/order of sources."""
+    sources = getattr(image_processing, "sources", None)
+    if payload.get("shot_sources") != sources:
+        raise ValueError(
+            "Blanks JSON shot sources do not match this dataset. "
+            "Select blanks again for the current runs and their ordering."
+        )
+
+
+@dataclass(frozen=True)
 class ParameterGroup:
     params: Tuple[Tuple[str, Any], ...]
     run_numbers: Tuple[int, ...]
@@ -378,7 +464,7 @@ class BadImageSelectionGUI:
         )
         self.max_image_slider = Slider(
             control_axes(0.05, 0.68, 0.90, 0.040),
-            "Max image",
+            "Max shot ID" if hasattr(self.image_processing, "sources") else "Max image",
             self.min_image_number,
             self.max_image_number,
             valinit=self.max_image_number,
@@ -536,12 +622,23 @@ class BadImageSelectionGUI:
         self.ax_linear_nk.set_yscale("linear")
 
         self.ax_n.set_title("Atom number N")
-        self.ax_n.set_xlabel("Image number")
+        shot_axis_label = "Combined shot ID" if hasattr(self.image_processing, "sources") else "Image number"
+        self.ax_n.set_xlabel(shot_axis_label)
         self.ax_n.set_ylabel("N")
 
         self.ax_energy.set_title("Energy")
-        self.ax_energy.set_xlabel("Image number")
+        self.ax_energy.set_xlabel(shot_axis_label)
         self.ax_energy.set_ylabel("Energy")
+        if hasattr(self.image_processing, "sources"):
+            def source_coordinate(x, y):
+                shot_id = int(round(x))
+                source = self.image_processing.sources.get(str(shot_id))
+                if source is None:
+                    return f"shot ID={x:.1f}, y={y:.4g}"
+                return f"shot {shot_id}: {source['run']}, image {source['image_number']} | y={y:.4g}"
+
+            self.ax_n.format_coord = source_coordinate
+            self.ax_energy.format_coord = source_coordinate
 
         cmap = plt.cm.get_cmap("tab20", max(1, len(group.run_numbers)))
         n_values = []
@@ -587,6 +684,20 @@ class BadImageSelectionGUI:
 
         self.ax_n.plot(x_values, n_values, color="0.6", alpha=0.4)
         self.ax_energy.plot(x_values, e_values, color="0.6", alpha=0.4)
+        sources = getattr(self.image_processing, "sources", {})
+        source_ids = sorted(int(shot_id) for shot_id in sources)
+        for left_id, right_id in zip(source_ids, source_ids[1:]):
+            if sources[str(left_id)]["run"] == sources[str(right_id)]["run"]:
+                continue
+            # Use the full dataset's boundary, even when this group contains
+            # only a few of the shots on either side of it.
+            boundary = (left_id + right_id) / 2
+            if x_values and min(x_values) < boundary < max(x_values):
+                for axis in (self.ax_n, self.ax_energy):
+                    axis.axvline(
+                        boundary, color="0.5", alpha=0.3,
+                        linewidth=0.8, linestyle="--", zorder=0,
+                    )
         if self.k_range is not None:
             self.ax_profiles.set_xlim(*self.k_range)
             self.ax_linear_nk.set_xlim(*self.k_range)
@@ -756,6 +867,7 @@ class BadImageSelectionGUI:
             payload = _load_json_file(path, "blanks")
             if not isinstance(payload, dict):
                 raise ValueError("Blanks JSON must contain an object.")
+            _validate_blank_sources(payload, self.image_processing)
             blank_numbers = payload.get("blank_image_numbers")
             if not isinstance(blank_numbers, list):
                 raise ValueError("Blanks JSON must contain a 'blank_image_numbers' list.")
@@ -805,6 +917,8 @@ class BadImageSelectionGUI:
                 "upper_sigma": self.sigma_thresholds[1],
             },
         }
+        if hasattr(self.image_processing, "sources"):
+            payload["shot_sources"] = self.image_processing.sources
         outpath.write_text(json.dumps(payload, indent=2))
         return outpath
 
@@ -2088,11 +2202,12 @@ def _patch_profiles(
 class MomentumDistributionPipeline:
     def __init__(
         self,
-        data_directory: str,
-        data_suffix: str,
-        run_parameters: RunParameters,
-        output_directory: str,
+        data_directory: Optional[str] = None,
+        data_suffix: Optional[str] = None,
+        run_parameters: Optional[RunParameters] = None,
+        output_directory: Optional[str] = None,
         *,
+        runs: Optional[Sequence[PipelineRun]] = None,
         sort_parameter: Optional[str] = None,
         detuning_parameter: str = "detuning",
         tof_parameter: str = "ToF",
@@ -2105,6 +2220,21 @@ class MomentumDistributionPipeline:
         patch_validity_ranges_json: Optional[str] = None,
         excluded_parameter_combinations: Optional[Sequence[Dict[str, Any]]] = None,
     ):
+        if output_directory is None:
+            raise ValueError("output_directory is required.")
+        if runs is not None:
+            if any(value is not None for value in (data_directory, data_suffix, run_parameters)):
+                raise ValueError("Pass either runs or the single-run arguments, not both.")
+            runs = list(runs)
+            if not runs or not all(isinstance(run, PipelineRun) for run in runs):
+                raise ValueError("runs must be a non-empty sequence of PipelineRun instances.")
+            self.image_processing = _CombinedImageProcessing(runs, two_d)
+            self.run_parameters = self.image_processing.run_parameters
+        else:
+            if any(value is None for value in (data_directory, data_suffix, run_parameters)):
+                raise ValueError("Provide runs, or data_directory, data_suffix and run_parameters.")
+            self.image_processing = ImageProcessing(data_directory, data_suffix, twoD=two_d)
+            self.run_parameters = run_parameters
         self.output_directory = Path(output_directory)
         self.output_directory.mkdir(parents=True, exist_ok=True)
         self.detuning_parameter = detuning_parameter
@@ -2116,8 +2246,6 @@ class MomentumDistributionPipeline:
             detuning_activation_times
         )
 
-        self.image_processing = ImageProcessing(data_directory, data_suffix, twoD=two_d)
-        self.run_parameters = run_parameters
         self.groups = group_run_numbers(
             run_parameters=self.run_parameters,
             run_numbers=self.image_processing.inums,
@@ -2161,6 +2289,7 @@ class MomentumDistributionPipeline:
             blank_numbers = blanks_payload.get("blank_image_numbers") if isinstance(blanks_payload, dict) else None
             if not isinstance(blank_numbers, list):
                 raise ValueError("Blanks JSON must contain a 'blank_image_numbers' list.")
+            _validate_blank_sources(blanks_payload, self.image_processing)
             self.blanks = sorted({int(image_number) for image_number in blank_numbers})
 
         if detuning_rescale_factors_json is not None:
@@ -2188,6 +2317,11 @@ class MomentumDistributionPipeline:
                 raise ValueError(
                     "Each patch range must contain numeric 'k_min' and 'k_max' values."
                 ) from exc
+
+        if hasattr(self.image_processing, "sources"):
+            (self.output_directory / "shot_sources.json").write_text(
+                json.dumps(self.image_processing.sources, indent=2)
+            )
 
     @staticmethod
     def _validate_activation_times(
@@ -2326,6 +2460,11 @@ class MomentumDistributionPipeline:
                     "file": file_name,
                 }
             )
+
+            if hasattr(self.image_processing, "sources"):
+                manifest[-1]["shot_sources"] = [
+                    self.image_processing.sources[str(inum)] for inum in valid_runs
+                ]
 
         (averaged_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
         self.averaged_profiles = averaged_profiles
@@ -2491,11 +2630,12 @@ class MomentumDistributionPipeline:
 
 
 def run_full_pipeline(
-    data_directory: str,
-    data_suffix: str,
-    run_parameters: RunParameters,
-    output_directory: str,
+    data_directory: Optional[str] = None,
+    data_suffix: Optional[str] = None,
+    run_parameters: Optional[RunParameters] = None,
+    output_directory: Optional[str] = None,
     *,
+    runs: Optional[Sequence[PipelineRun]] = None,
     sort_parameter: Optional[str] = None,
     detuning_parameter: str = "detuning",
     tof_parameter: str = "ToF",
@@ -2509,6 +2649,7 @@ def run_full_pipeline(
     excluded_parameter_combinations: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> MomentumDistributionPipeline:
     pipeline = MomentumDistributionPipeline(
+        runs=runs,
         data_directory=data_directory,
         data_suffix=data_suffix,
         run_parameters=run_parameters,

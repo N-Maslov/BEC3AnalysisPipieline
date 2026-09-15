@@ -163,7 +163,7 @@ class ImageProcessing:
         with open(filepath_ds, 'r', encoding='utf-8', errors='surrogateescape') as f:
             first = f.readline()
         ds_delim = '\t' if '\t' in first else ','
-        self.calc_data = np.genfromtxt(filepath_ds, names=True, delimiter=ds_delim)
+        self.calc_data = np.atleast_1d(np.genfromtxt(filepath_ds, names=True, delimiter=ds_delim))
 
 
     def _get_from_inum(self, inum: int) -> Dict[str, Any]:

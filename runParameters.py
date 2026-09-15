@@ -120,6 +120,27 @@ class RunParameters:
                 filtered_inums.append(inum)
         return filtered_inums
 
+    @classmethod
+    def from_assignments(cls, variable_names, assignments):
+        """Build an explicit shot schedule, without inventing a repeating pattern.
+
+        Used when joining independently scheduled runs. Parameter dictionaries
+        are copied so the original schedules remain unchanged.
+        """
+        result = cls.__new__(cls)
+        result.variable_names = list(variable_names)
+        result.runs = {number: dict(params) for number, params in assignments.items()}
+        if any(set(params) != set(result.variable_names) for params in result.runs.values()):
+            raise ValueError("Every assignment must contain exactly the declared parameter names.")
+        result.run_numbers = list(result.runs)
+        result.operators = ["."] * (len(result.variable_names) - 1)
+        result.values = {
+            name: [params[name] for params in result.runs.values()]
+            for name in result.variable_names
+        }
+        result.periodicity = None
+        return result
+
     def __getitem__(self, run_number: int):
         return self.runs[run_number]
 

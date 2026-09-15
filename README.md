@@ -71,6 +71,66 @@ All data remain visible in the bad-image, rescaling, and validity-range GUIs;
 series excluded from the final result are labelled accordingly. Averaged profile
 files are retained for every parameter combination.
 
+### Combining acquisitions from multiple runs
+
+Pass `runs` instead of the three single-run input arguments. Each `PipelineRun`
+has its own `RunParameters`, profile directory and filename suffix:
+
+```python
+from momentumPipeline import PipelineRun, run_full_pipeline
+
+# Keep each acquisition's actual image numbers and parameter schedule.
+original_params = RunParameters(
+    [1, 2, 3, 4], ["waittime", "detuning", "ToF"], ["x", "."],
+    {"waittime": [0, 100], "detuning": [6], "ToF": [60]},
+)
+extra_params = RunParameters(
+    [1, 2, 3, 4], ["waittime", "detuning", "ToF"], ["x", "."],
+    {"waittime": [100, 200], "detuning": [6], "ToF": [60]},
+)
+pipeline = run_full_pipeline(
+    runs=[
+        PipelineRun("/path/to/original/Profiles", "original_suffix", original_params,
+                    name="original"),
+        PipelineRun("/path/to/extra/Profiles", "extra_suffix", extra_params,
+                    name="extra"),
+    ],
+    output_directory="/path/to/combined/Output",
+    sort_parameter="waittime",
+    non_detuned_value=6,
+)
+```
+
+All runs must declare the same parameter names; their values, variable order,
+operators, image numbers and repetition counts may differ. Shots with identical
+values for **all** parameters are pooled before averaging. In this example,
+waittime 100 combines both acquisitions, while 0 and 200 remain separate.
+Means and standard errors use individual shots, so runs with more retained
+shots contribute proportionally more. Only images present in a run's files
+and its `RunParameters` schedule contribute. Missing images do not shift the
+schedule. Exclusions and all subsequent processing settings apply to every run.
+Missing ds columns in one run contribute no values to that column's statistics.
+
+In `runs` mode, shots receive consecutive IDs starting at 1, ordered by the
+input run list and then original image number. This avoids collisions when
+different acquisitions reuse image numbers. The bad-image GUI and its cutoff
+use these combined IDs; hovering over the N/Energy axes shows the source run
+and original image number in the coordinate readout. `shot_sources.json` maps
+every ID back to its run, directory, suffix and original image number; averaged
+profile manifests also record their contributing sources. Names are optional
+(default `run_1`, `run_2`, etc.) and must be unique.
+
+All results go to the one `output_directory`, including
+`averaged_ds_combined.txt`. Combined `blanks.json` files include the ID mapping
+and can only be reused with the same source mapping. After adding/reordering
+runs or changing the loaded shot set, select blanks again; single-run blanks
+cannot be applied to combined IDs. Existing single-run calls remain supported
+and retain their original image numbers and output names.
+
+`analysis/GPEB/s17.py` shows this setup with an optional extra acquisition.
+The same `runs` argument is available on `MomentumDistributionPipeline` for
+step-by-step processing.
+
 ### Excluding bad parameter combinations
 
 Pass `excluded_parameter_combinations` to `run_full_pipeline` or
