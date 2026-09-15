@@ -71,6 +71,27 @@ All data remain visible in the bad-image, rescaling, and validity-range GUIs;
 series excluded from the final result are labelled accordingly. Averaged profile
 files are retained for every parameter combination.
 
+### Excluding bad parameter combinations
+
+Pass `excluded_parameter_combinations` to `run_full_pipeline` or
+`MomentumDistributionPipeline` to skip unwanted data throughout the GUIs,
+averaging, rescaling, and final patching:
+
+```python
+excluded_parameter_combinations=[{"detuning": -58}]
+```
+
+Each dictionary matches all of its fields together. For example,
+`[{"detuning": -58, "ToF": 120}, {"a": 100, "waittime": 300}]`
+excludes shots matching either combination. Unspecified parameters can have any
+value. Unknown parameter names and empty dictionaries raise an error.
+Keep the original `RunParameters` values and run numbers unchanged so image
+numbers retain their correct parameter assignments. Excluded detuned groups
+also no longer replace their non-detuned reference groups.
+
+When reusing an output directory, manifests describe the current run; old CSV
+files from earlier runs may still exist and should not be treated as current results.
+
 After completion, `output_directory` will contain:
 
 - `blanks.json`

@@ -154,12 +154,28 @@ def group_run_numbers(
     run_parameters: RunParameters,
     run_numbers: Sequence[int],
     sort_parameter: Optional[str] = None,
+    excluded_parameter_combinations: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> List[ParameterGroup]:
+    """Group shots, excluding matches without changing the original run schedule.
+
+    All fields in an exclusion must match; matching any exclusion skips a shot.
+    """
+    exclusions = list(excluded_parameter_combinations or ())
+    for criteria in exclusions:
+        if not isinstance(criteria, dict) or not criteria:
+            raise ValueError("Each excluded parameter combination must be a non-empty dictionary.")
+        unknown = set(criteria) - set(run_parameters.variable_names)
+        if unknown:
+            raise ValueError(f"Unknown excluded parameter names: {sorted(unknown)}")
+
     grouped: Dict[Tuple[Tuple[str, Any], ...], List[int]] = {}
     ordered_names = list(run_parameters.variable_names)
 
     for run_number in run_numbers:
         params = run_parameters[run_number]
+        if any(all(params[name] == value for name, value in criteria.items())
+               for criteria in exclusions):
+            continue
         key = tuple((name, _to_python_scalar(params[name])) for name in ordered_names)
         grouped.setdefault(key, []).append(run_number)
 
@@ -2087,6 +2103,7 @@ class MomentumDistributionPipeline:
         blanks_json: Optional[str] = None,
         detuning_rescale_factors_json: Optional[str] = None,
         patch_validity_ranges_json: Optional[str] = None,
+        excluded_parameter_combinations: Optional[Sequence[Dict[str, Any]]] = None,
     ):
         self.output_directory = Path(output_directory)
         self.output_directory.mkdir(parents=True, exist_ok=True)
@@ -2105,7 +2122,10 @@ class MomentumDistributionPipeline:
             run_parameters=self.run_parameters,
             run_numbers=self.image_processing.inums,
             sort_parameter=sort_parameter,
+            excluded_parameter_combinations=excluded_parameter_combinations,
         )
+        if not self.groups:
+            raise ValueError("No parameter groups remain after applying parameter exclusions.")
         # A range must distinguish physical configurations such as a
         # calibration setting, but can be shared across the swept sort axis
         # (normally waittime).
@@ -2486,6 +2506,7 @@ def run_full_pipeline(
     blanks_json: Optional[str] = None,
     detuning_rescale_factors_json: Optional[str] = None,
     patch_validity_ranges_json: Optional[str] = None,
+    excluded_parameter_combinations: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> MomentumDistributionPipeline:
     pipeline = MomentumDistributionPipeline(
         data_directory=data_directory,
@@ -2502,6 +2523,7 @@ def run_full_pipeline(
         blanks_json=blanks_json,
         detuning_rescale_factors_json=detuning_rescale_factors_json,
         patch_validity_ranges_json=patch_validity_ranges_json,
+        excluded_parameter_combinations=excluded_parameter_combinations,
     )
     pipeline.remove_bad_images()
     pipeline.compute_averaged_momentum_distributions()
