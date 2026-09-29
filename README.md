@@ -210,11 +210,26 @@ Rescaled profiles are retained in memory for patching but are not saved separate
 they are fully reproducible by applying `detuning_rescale_factors.json` to the
 matching files in `averaged_profiles/`.
 
-Final profiles are constructed on logarithmic k bins. Within each bin, each
-Each `(ToF, detuning, ...)` configuration contributes one local log-log estimate at the bin
-centre; those estimates are then inverse-variance weighted together. The final
-CSV therefore uses `n_combinations` for its fourth column rather than
-`n_shots`.
+Final profiles use the lowest TOF with valid data in each k range to set the
+bin centres. Starting with the lowest TOF's valid positive k values, each
+successively higher TOF supplies additional centres only outside ranges
+already covered by lower TOFs. Thus the finer grids of longer TOFs are used
+at low k, and also fill gaps left by validity selections or non-finite data.
+Detunings at the same TOF share priority and duplicate centres are merged.
+Bin boundaries lie halfway between adjacent centres, including where the
+reference TOF changes; midpoint ties enter the higher bin.
+Displayed `(ToF, detuning, ...)` profiles retain the mean and standard error
+across experimental repetitions at each k. A final bin containing just one
+such point retains that mean and standard error. When points are merged,
+the final mean and sample standard deviation are calculated across all
+underlying individual measurements, giving each measurement equal weight.
+These statistics are recovered exactly from each point's mean, standard
+error, and repetition count, including both within-point and between-point
+variation. The final error is that sample standard deviation divided by
+`sqrt(N)`, where `N` is the largest repetition count among the contributing
+points, not the number of k samples or the sum of repetition counts.
+The final CSV's existing `n_shots` column still counts contributing profile
+points; it is not the `N` used for this error calculation.
 
 ## Step-by-step (non-wrapper) usage
 

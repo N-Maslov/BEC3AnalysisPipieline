@@ -2104,14 +2104,17 @@ def _patch_profiles(
     tof_parameter: str,
     detuning_parameter: str,
     range_parameters: Sequence[str] = (),
-    bins_per_decade: int = 40,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Use the lowest-TOF valid sampling grid available in each k range."""
     all_k: List[float] = []
     all_nk: List[float] = []
     all_err: List[float] = []
-    all_combos: List[str] = []
+    all_repetitions: List[int] = []
+    grids_by_tof: Dict[float, List[np.ndarray]] = {}
 
     for profile in profiles:
+        if not profile.included_in_final:
+            continue
         params = profile.group.as_dict()
         combo_key = _patch_range_key(
             params,
@@ -2143,11 +2146,23 @@ def _patch_profiles(
             & (profile.k >= k_low)
             & (profile.k <= k_high)
             & (profile.k > 0)
+            & np.isfinite(profile.n_shots_per_point)
+            & (profile.n_shots_per_point > 0)
         )
+        if np.any(valid):
+            tof = float(params[tof_parameter])
+            # Keep separate contiguous valid runs so masked gaps can use
+            # another TOF's grid instead of being treated as covered.
+            order = np.argsort(profile.k)
+            valid_indices = np.flatnonzero(valid[order])
+            runs = np.split(valid_indices, np.flatnonzero(np.diff(valid_indices) > 1) + 1)
+            grids_by_tof.setdefault(tof, []).extend(
+                np.unique(profile.k[order[run]]) for run in runs
+            )
         all_k.extend(profile.k[valid].tolist())
         all_nk.extend(profile.nk[valid].tolist())
         all_err.extend(profile.stderr[valid].tolist())
-        all_combos.extend([combo_key] * int(np.sum(valid)))
+        all_repetitions.extend(profile.n_shots_per_point[valid].tolist())
 
     if not all_k:
         raise ValueError("No valid points available after applying patch validity ranges.")
@@ -2155,22 +2170,27 @@ def _patch_profiles(
     k_arr = np.asarray(all_k, dtype=float)
     nk_arr = np.asarray(all_nk, dtype=float)
     err_arr = np.asarray(all_err, dtype=float)
-    combo_arr = np.asarray(all_combos, dtype=object)
+    repetition_arr = np.asarray(all_repetitions, dtype=float)
 
-    log_min = np.log10(np.min(k_arr))
-    log_max = np.log10(np.max(k_arr))
-    num_bins = max(20, int(np.ceil((log_max - log_min) * bins_per_decade)))
-    edges = np.logspace(log_min, log_max, num_bins + 1)
-    centers = np.sqrt(edges[:-1] * edges[1:])
+    reference_grids = []
+    covered_ranges = []
+    for tof in sorted(grids_by_tof):
+        grids = grids_by_tof[tof]
+        for grid in grids:
+            uncovered = np.ones(grid.size, dtype=bool)
+            for low, high in covered_ranges:
+                uncovered &= (grid < low) | (grid > high)
+            reference_grids.append(grid[uncovered])
+        # Equal-TOF detunings share priority. Add their coverage only after
+        # all their grids have been considered, keeping input order irrelevant.
+        covered_ranges.extend((grid[0], grid[-1]) for grid in grids)
 
-    # np.digitize assigns a point exactly on the upper edge to one past the
-    # final bin; retain it in the final bin instead of dropping it.
-    bin_ids = np.minimum(np.digitize(k_arr, edges) - 1, num_bins - 1)
-    valid_bins = (bin_ids >= 0) & (bin_ids < num_bins)
-    bin_ids = bin_ids[valid_bins]
-    nk_arr = nk_arr[valid_bins]
-    err_arr = err_arr[valid_bins]
-    combo_arr = combo_arr[valid_bins]
+    centers = np.unique(np.concatenate(reference_grids))
+    num_bins = centers.size
+    boundaries = centers[:-1] + np.diff(centers) / 2.0
+    # Assign to the nearest reference k, with midpoint ties going to the
+    # higher bin. The stitched grid spans all contributing TOFs' valid data.
+    bin_ids = np.searchsorted(boundaries, k_arr, side="right")
 
     out_k: List[float] = []
     out_nk: List[float] = []
@@ -2181,52 +2201,30 @@ def _patch_profiles(
         in_bin = bin_ids == bin_idx
         if not np.any(in_bin):
             continue
-        # First reduce every (ToF, detuning) combination to one estimate, then
-        # combine those estimates at the second stage.
-        combo_means: List[float] = []
-        combo_errors: List[float] = []
-        for combo_key in np.unique(combo_arr[in_bin]):
-            from_combo = in_bin & (combo_arr == combo_key)
-            combo_nk = nk_arr[from_combo]
-            combo_err = err_arr[from_combo]
-            positive_error = combo_err > 0
-            if np.any(positive_error):
-                combo_weights = 1.0 / np.square(combo_err[positive_error])
-                combo_means.append(
-                    float(
-                        np.sum(combo_weights * combo_nk[positive_error])
-                        / np.sum(combo_weights)
-                    )
-                )
-                combo_errors.append(float(np.sqrt(1.0 / np.sum(combo_weights))))
-            else:
-                combo_means.append(float(np.mean(combo_nk)))
-                combo_errors.append(
-                    float(np.std(combo_nk, ddof=1) / np.sqrt(combo_nk.size))
-                    if combo_nk.size > 1
-                    else 0.0
-                )
-
-        combo_means_arr = np.asarray(combo_means)
-        combo_errors_arr = np.asarray(combo_errors)
-        positive_combo_error = combo_errors_arr > 0
-        if np.any(positive_combo_error):
-            weights = 1.0 / np.square(combo_errors_arr[positive_combo_error])
-            weighted_mean = float(
-                np.sum(weights * combo_means_arr[positive_combo_error]) / np.sum(weights)
-            )
-            combined_err = float(np.sqrt(1.0 / np.sum(weights)))
+        means = nk_arr[in_bin]
+        errors = err_arr[in_bin]
+        repetitions = repetition_arr[in_bin]
+        if means.size == 1:
+            # A single averaged k point already has the experimental mean
+            # and standard error; do not estimate its error from k scatter.
+            mean = float(means[0])
+            combined_err = float(errors[0])
         else:
-            weighted_mean = float(np.mean(combo_means_arr))
-            combined_err = (
-                float(np.std(combo_means_arr, ddof=1) / np.sqrt(combo_means_arr.size))
-                if combo_means_arr.size > 1
-                else 0.0
-            )
+            # Recover the statistics of all underlying measurements from
+            # their sufficient statistics. SEM_i = sample_std_i / sqrt(n_i).
+            # Each original measurement has equal weight, including all k
+            # samples contributed by the more finely sampled longer TOFs.
+            sample_count = float(np.sum(repetitions))
+            mean = float(np.sum(repetitions * means) / sample_count)
+            within_ss = np.sum(errors**2 * repetitions * (repetitions - 1))
+            between_ss = np.sum(repetitions * (means - mean)**2)
+            sample_variance = (within_ss + between_ss) / (sample_count - 1)
+            # More k samples do not mean more experimental repetitions.
+            combined_err = float(np.sqrt(sample_variance / np.max(repetitions)))
 
         out_k.append(float(centers[bin_idx]))
-        out_nk.append(float(weighted_mean))
-        out_err.append(float(combined_err))
+        out_nk.append(mean)
+        out_err.append(combined_err)
         out_count.append(int(np.sum(in_bin)))
 
     return (
