@@ -76,6 +76,30 @@ The detuning with the earliest interval start is the rescaling reference
 the reference. There is no separate `non_detuned_value` argument. Include the
 reference in the acquired data so other detunings can be compared against it.
 
+To use different intervals for different experimental settings, add conditional
+rules (for example, different switch times for `a=100` and `a=200`):
+
+```python
+detuning_activation_conditions=[
+    {"conditions": {"a": 100},
+     "activation_times": {6: (0, 1000), -22: (1000, float("inf"))}},
+    {"conditions": {"a": 200},
+     "activation_times": {6: (0, 1300), -22: (1300, float("inf"))}},
+]
+```
+
+Pass this to either `MomentumDistributionPipeline` or `run_full_pipeline`.
+Every parameter in `conditions` must match; for example,
+`{"a": 100, "ToF": 120}` restricts a rule to both settings. The first matching
+rule supplies the entire interval dictionary, replacing rather than merging
+with `detuning_activation_times`. Unmatched groups use `detuning_activation_times`;
+if that is omitted or empty, they are unrestricted. An empty rule dictionary
+(`"activation_times": {}`) also leaves matching groups unrestricted.
+The non-detuned fallback for TOFs without matching detuned data still applies.
+Rescaling continues to use one shared reference: the earliest interval start
+across the default dictionary and all rules (default first, then rule order
+breaks ties).
+
 All data remain visible in the bad-image, rescaling, and validity-range GUIs;
 series excluded from the final result are labelled accordingly. Averaged profile
 files are retained for every parameter combination.

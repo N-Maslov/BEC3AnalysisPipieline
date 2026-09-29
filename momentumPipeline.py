@@ -2250,6 +2250,7 @@ class MomentumDistributionPipeline:
         detuning_parameter: str = "detuning",
         tof_parameter: str = "ToF",
         detuning_activation_times: Optional[Dict[Any, Tuple[float, float]]] = None,
+        detuning_activation_conditions: Optional[Sequence[Dict[str, Any]]] = None,
         activation_time_parameter: Optional[str] = None,
         two_d: bool = False,
         blanks_json: Optional[str] = None,
@@ -2282,6 +2283,10 @@ class MomentumDistributionPipeline:
             detuning_activation_times
         )
 
+        self.detuning_activation_conditions = self._validate_activation_conditions(
+            detuning_activation_conditions
+        )
+
         self.groups = group_run_numbers(
             run_parameters=self.run_parameters,
             run_numbers=self.image_processing.inums,
@@ -2306,9 +2311,12 @@ class MomentumDistributionPipeline:
             )
         # Rescaling needs a reference even when it is excluded from final patches.
         # The first interval to start defines the reference (mapping order breaks ties).
+        reference_intervals = list(self.detuning_activation_times.items())
+        for rule in self.detuning_activation_conditions:
+            reference_intervals.extend(rule["activation_times"].items())
         reference_detuning = (
-            min(self.detuning_activation_times, key=lambda key: self.detuning_activation_times[key][0])
-            if self.detuning_activation_times
+            min(reference_intervals, key=lambda item: item[1][0])[0]
+            if reference_intervals
             else self.groups[0].as_dict().get(self.detuning_parameter)
         )
         self.non_detuned_value = next(
@@ -2387,15 +2395,45 @@ class MomentumDistributionPipeline:
             intervals[detuning] = (tmin, tmax)
         return intervals
 
+    def _validate_activation_conditions(self, rules):
+        if rules is None:
+            return []
+        if not isinstance(rules, (list, tuple)):
+            raise ValueError("detuning_activation_conditions must be a list of rules.")
+        validated = []
+        for rule in rules:
+            if not isinstance(rule, dict) or set(rule) != {"conditions", "activation_times"}:
+                raise ValueError("Each activation rule must contain conditions and activation_times.")
+            conditions = rule["conditions"]
+            if not isinstance(conditions, dict) or not conditions:
+                raise ValueError("Activation rule conditions must be a non-empty parameter mapping.")
+            unknown = set(conditions) - set(self.run_parameters.variable_names)
+            if unknown:
+                raise ValueError(f"Unknown activation condition parameters: {sorted(unknown)}")
+            if not isinstance(rule["activation_times"], dict):
+                raise ValueError("Rule activation_times must be a detuning interval mapping.")
+            validated.append({
+                "conditions": dict(conditions),
+                "activation_times": self._validate_activation_times(rule["activation_times"]),
+            })
+        return validated
+
+    def _activation_times_for_group(self, params):
+        for rule in self.detuning_activation_conditions:
+            if all(params.get(name) == value for name, value in rule["conditions"].items()):
+                return rule["activation_times"]
+        return self.detuning_activation_times
+
     @staticmethod
     def _detunings_match(left: Any, right: Any) -> bool:
         return left == right or str(left) == str(right)
 
     def _group_is_active(self, group: ParameterGroup) -> bool:
         """Apply intervals, retaining reference groups without detuned counterparts."""
-        if not self.detuning_activation_times:
-            return True
         params = group.as_dict()
+        activation_times = self._activation_times_for_group(params)
+        if not activation_times:
+            return True
         if self._detunings_match(params.get(self.detuning_parameter), self.non_detuned_value):
             has_detuned_counterpart = any(
                 not self._detunings_match(
@@ -2424,7 +2462,7 @@ class MomentumDistributionPipeline:
             raise ValueError("Activation time parameter must contain finite numeric times.")
         return any(
             tmin <= group_time < tmax
-            for detuning, (tmin, tmax) in self.detuning_activation_times.items()
+            for detuning, (tmin, tmax) in activation_times.items()
             if self._detunings_match(detuning, params.get(self.detuning_parameter))
         )
 
@@ -2663,6 +2701,7 @@ def run_full_pipeline(
     detuning_parameter: str = "detuning",
     tof_parameter: str = "ToF",
     detuning_activation_times: Optional[Dict[Any, Tuple[float, float]]] = None,
+    detuning_activation_conditions: Optional[Sequence[Dict[str, Any]]] = None,
     activation_time_parameter: Optional[str] = None,
     two_d: bool = False,
     blanks_json: Optional[str] = None,
@@ -2680,6 +2719,7 @@ def run_full_pipeline(
         detuning_parameter=detuning_parameter,
         tof_parameter=tof_parameter,
         detuning_activation_times=detuning_activation_times,
+        detuning_activation_conditions=detuning_activation_conditions,
         activation_time_parameter=activation_time_parameter,
         two_d=two_d,
         blanks_json=blanks_json,
