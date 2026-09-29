@@ -1,5 +1,6 @@
 import csv
 import json
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -92,14 +93,86 @@ class _CombinedImageProcessing(ImageProcessing):
         return {"k": shot["k"], "nk": shot["nk"], "calc": calc}
 
 
-def _validate_blank_sources(payload: Dict[str, Any], image_processing: ImageProcessing) -> None:
-    """Never apply combined numeric IDs to a different set/order of sources."""
-    sources = getattr(image_processing, "sources", None)
-    if payload.get("shot_sources") != sources:
-        raise ValueError(
-            "Blanks JSON shot sources do not match this dataset. "
-            "Select blanks again for the current runs and their ordering."
-        )
+def _blank_sources(image_processing: ImageProcessing) -> Dict[str, Any]:
+    if hasattr(image_processing, "sources"):
+        return image_processing.sources
+    return {
+        str(number): {"data_suffix": image_processing.suffix,
+                      "run": "1", "image_number": number}
+        for number in image_processing.inums
+    }
+
+
+def _blank_identity(source: Dict[str, Any]) -> Tuple[Any, ...]:
+    # Acquisition dates and original image numbers remain stable when runs
+    # grow, move directories, or are renamed/reordered.
+    if not isinstance(source, dict) or not all(
+        field in source for field in ("data_suffix", "run", "image_number")
+    ):
+        raise ValueError("Each blank source must identify its set, run and image number.")
+    suffix = str(source["data_suffix"])
+    date = re.search(r"\d{4}-\d{2}-\d{2}", suffix)
+    acquisition = (date.group(),) if date else (suffix, str(source["run"]))
+    return (*acquisition, int(source["image_number"]))
+
+
+def _load_blank_numbers(payload: Dict[str, Any], image_processing: ImageProcessing) -> List[int]:
+    """Read compact selections or migrate legacy combined IDs by identity."""
+    if not isinstance(payload, dict):
+        raise ValueError("Blanks JSON must contain an object.")
+    selected = []
+    if "sets" in payload:
+        sets = payload["sets"]
+        if not isinstance(sets, dict):
+            raise ValueError("Blanks JSON 'sets' must be an object.")
+        for suffix, group in sets.items():
+            if not isinstance(group, dict) or not isinstance(group.get("subruns"), dict):
+                raise ValueError("Each set must contain a 'subruns' object.")
+            for run, entry in group["subruns"].items():
+                if not isinstance(entry, dict) or not isinstance(entry.get("blanks"), list):
+                    raise ValueError("Each subrun must contain a 'blanks' list.")
+                selected.extend({"data_suffix": suffix, "run": run, "image_number": number}
+                                for number in entry["blanks"])
+    else:
+        numbers = payload.get("blank_image_numbers")
+        if not isinstance(numbers, list):
+            raise ValueError("Blanks JSON must contain 'sets' or a 'blank_image_numbers' list.")
+        saved_sources = payload.get("shot_sources")
+        if saved_sources is None:
+            if hasattr(image_processing, "sources"):
+                raise ValueError("Legacy combined blanks require shot sources to identify images.")
+            return sorted(set(map(int, numbers)) & set(image_processing.inums))
+        if not isinstance(saved_sources, dict):
+            raise ValueError("Blanks JSON shot sources must be an object.")
+        for number in numbers:
+            if str(number) not in saved_sources:
+                raise ValueError(f"Missing saved source for blank {number}.")
+            selected.append(saved_sources[str(number)])
+
+    current = {}
+    for number, source in _blank_sources(image_processing).items():
+        key = _blank_identity(source)
+        current.setdefault(key, []).append(int(number))
+    result = set()
+    for source in selected:
+        key = _blank_identity(source)
+        matches = current.get(key, [])
+        if len(matches) != 1:
+            reason = "missing from" if not matches else "ambiguous in"
+            raise ValueError(f"Saved blank {key} is {reason} the current dataset.")
+        result.add(matches[0])
+    return sorted(result)
+
+
+def _blank_payload(image_processing: ImageProcessing, numbers: Iterable[int]) -> Dict[str, Any]:
+    sets = {}
+    sources = _blank_sources(image_processing)
+    for number in sorted(numbers):
+        source = sources[str(number)]
+        subruns = sets.setdefault(source["data_suffix"], {"subruns": {}})["subruns"]
+        entry = subruns.setdefault(source["run"], {"blanks": []})
+        entry["blanks"].append(int(source["image_number"]))
+    return {"sets": sets}
 
 
 @dataclass(frozen=True)
@@ -865,40 +938,16 @@ class BadImageSelectionGUI:
             if not path:
                 return
             payload = _load_json_file(path, "blanks")
-            if not isinstance(payload, dict):
-                raise ValueError("Blanks JSON must contain an object.")
-            _validate_blank_sources(payload, self.image_processing)
-            blank_numbers = payload.get("blank_image_numbers")
-            if not isinstance(blank_numbers, list):
-                raise ValueError("Blanks JSON must contain a 'blank_image_numbers' list.")
-
+            blank_numbers = _load_blank_numbers(payload, self.image_processing)
             known_images = {inum for group in self.groups for inum in group.run_numbers}
-            if "manual_blanks" in payload or "manual_includes" in payload:
-                manual_blanks = payload.get("manual_blanks", [])
-                manual_includes = payload.get("manual_includes", [])
-            else:
-                # Older files record only final blanks; retain those choices as
-                # manual exclusions when no detailed GUI state is available.
-                manual_blanks = blank_numbers
-                manual_includes = []
-            self.manual_blanks = {int(inum) for inum in manual_blanks if int(inum) in known_images}
-            self.manual_includes = {int(inum) for inum in manual_includes if int(inum) in known_images}
-
-            thresholds = payload.get("sigma_thresholds", {})
-            if isinstance(thresholds, dict):
-                low = float(thresholds.get("lower_sigma", self.sigma_thresholds[0]))
-                high = float(thresholds.get("upper_sigma", self.sigma_thresholds[1]))
-                if low < 0 or high < 0:
-                    raise ValueError("Sigma thresholds must be non-negative.")
-                self.sigma_thresholds = (low, high)
-                self._set_slider_silently(self.low_sigma_slider, low)
-                self._set_slider_silently(self.high_sigma_slider, high)
-            max_image = int(payload.get("max_image_number", self.max_image_number))
-            self.max_image_number = int(
-                min(max(max_image, self.max_image_slider.valmin), self.max_image_slider.valmax)
-            )
+            self.manual_blanks = set(blank_numbers) & known_images
+            # Import the saved decisions, not obsolete sigma/cutoff controls.
+            # Freeze current automatic suggestions so loading is exact; users
+            # can still click images or reset/recalculate selections afterward.
+            self.max_image_number = int(self.max_image_slider.valmax)
             self._set_slider_silently(self.max_image_slider, self.max_image_number)
             self._recalculate_sigma_blanks()
+            self.manual_includes = set().union(*self.sigma_blanks_by_group.values()) - self.manual_blanks
             self._refresh_plot()
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             self.range_panel.set_title(f"Could not load JSON: {exc}", fontsize=7, color="red", pad=4)
@@ -907,18 +956,7 @@ class BadImageSelectionGUI:
     def save(self) -> Path:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         outpath = self.output_dir / "blanks.json"
-        payload = {
-            "blank_image_numbers": self._effective_blanks(),
-            "manual_blanks": sorted(self.manual_blanks),
-            "manual_includes": sorted(self.manual_includes),
-            "max_image_number": self.max_image_number,
-            "sigma_thresholds": {
-                "lower_sigma": self.sigma_thresholds[0],
-                "upper_sigma": self.sigma_thresholds[1],
-            },
-        }
-        if hasattr(self.image_processing, "sources"):
-            payload["shot_sources"] = self.image_processing.sources
+        payload = _blank_payload(self.image_processing, self._effective_blanks())
         outpath.write_text(json.dumps(payload, indent=2))
         return outpath
 
@@ -2211,8 +2249,7 @@ class MomentumDistributionPipeline:
         sort_parameter: Optional[str] = None,
         detuning_parameter: str = "detuning",
         tof_parameter: str = "ToF",
-        non_detuned_value: Any = 12,
-        detuning_activation_times: Optional[Dict[Any, float]] = None,
+        detuning_activation_times: Optional[Dict[Any, Tuple[float, float]]] = None,
         activation_time_parameter: Optional[str] = None,
         two_d: bool = False,
         blanks_json: Optional[str] = None,
@@ -2239,7 +2276,6 @@ class MomentumDistributionPipeline:
         self.output_directory.mkdir(parents=True, exist_ok=True)
         self.detuning_parameter = detuning_parameter
         self.tof_parameter = tof_parameter
-        self.non_detuned_value = non_detuned_value
         self.sort_parameter = sort_parameter
         self.activation_time_parameter = activation_time_parameter
         self.detuning_activation_times = self._validate_activation_times(
@@ -2268,7 +2304,18 @@ class MomentumDistributionPipeline:
                 if "waittime" in self.run_parameters.variable_names
                 else sort_parameter or "waittime"
             )
-        self.default_detuning_activation_time = self._lowest_activation_time()
+        # Rescaling needs a reference even when it is excluded from final patches.
+        # The first interval to start defines the reference (mapping order breaks ties).
+        reference_detuning = (
+            min(self.detuning_activation_times, key=lambda key: self.detuning_activation_times[key][0])
+            if self.detuning_activation_times
+            else self.groups[0].as_dict().get(self.detuning_parameter)
+        )
+        self.non_detuned_value = next(
+            (group.as_dict().get(self.detuning_parameter) for group in self.groups
+             if self._detunings_match(group.as_dict().get(self.detuning_parameter), reference_detuning)),
+            reference_detuning,
+        )
         # Retained for callers that inspect the pipeline state.  All groups are
         # shown and processed; this list identifies groups used in final patches.
         self.active_groups = [
@@ -2286,11 +2333,7 @@ class MomentumDistributionPipeline:
 
         if blanks_json is not None:
             blanks_payload = _load_json_file(blanks_json, "blanks")
-            blank_numbers = blanks_payload.get("blank_image_numbers") if isinstance(blanks_payload, dict) else None
-            if not isinstance(blank_numbers, list):
-                raise ValueError("Blanks JSON must contain a 'blank_image_numbers' list.")
-            _validate_blank_sources(blanks_payload, self.image_processing)
-            self.blanks = sorted({int(image_number) for image_number in blank_numbers})
+            self.blanks = _load_blank_numbers(blanks_payload, self.image_processing)
 
         if detuning_rescale_factors_json is not None:
             factors_payload = _load_json_file(
@@ -2325,85 +2368,65 @@ class MomentumDistributionPipeline:
 
     @staticmethod
     def _validate_activation_times(
-        activation_times: Optional[Dict[Any, float]],
-    ) -> Dict[Any, float]:
+        activation_times: Optional[Dict[Any, Tuple[float, float]]],
+    ) -> Dict[Any, Tuple[float, float]]:
         if activation_times is None:
             return {}
         if not isinstance(activation_times, dict):
-            raise ValueError("detuning_activation_times must be a mapping of detunings to times.")
-        try:
-            return {
-                detuning: float(activation_time)
-                for detuning, activation_time in activation_times.items()
-            }
-        except (TypeError, ValueError) as exc:
-            raise ValueError("Every detuning activation time must be numeric.") from exc
-
-    def _lowest_activation_time(self) -> Optional[float]:
-        """Return the earliest scheduled time, if this dataset has a time parameter."""
-        time_values = []
-        for group in self.groups:
-            value = group.as_dict().get(self.activation_time_parameter)
-            if value is None:
-                continue
+            raise ValueError("detuning_activation_times must map detunings to (tmin, tmax) pairs.")
+        intervals = {}
+        for detuning, bounds in activation_times.items():
+            if not isinstance(bounds, (tuple, list)) or len(bounds) != 2:
+                raise ValueError("Each detuning interval must be a (tmin, tmax) pair.")
             try:
-                time_values.append(float(value))
+                tmin, tmax = map(float, bounds)
             except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    f"Activation time parameter '{self.activation_time_parameter}' must be numeric."
-                ) from exc
-        if not time_values:
-            if self.detuning_activation_times:
-                raise ValueError(
-                    f"Activation time parameter '{self.activation_time_parameter}' was not found in the run parameters."
-                )
-            return None
-        return min(time_values)
+                raise ValueError("Detuning interval bounds must be numeric.") from exc
+            if not tmin < tmax:
+                raise ValueError("Detuning intervals must satisfy tmin < tmax and cannot contain NaN.")
+            intervals[detuning] = (tmin, tmax)
+        return intervals
 
-    def _activation_time_for_detuning(self, detuning_value: Any) -> Optional[float]:
-        """Get a detuning's requested activation time, defaulting to the earliest time."""
-        for configured_detuning, activation_time in self.detuning_activation_times.items():
-            if configured_detuning == detuning_value or str(configured_detuning) == str(detuning_value):
-                return activation_time
-        return self.default_detuning_activation_time
+    @staticmethod
+    def _detunings_match(left: Any, right: Any) -> bool:
+        return left == right or str(left) == str(right)
 
-    def _detuned_group_is_active(self, group: ParameterGroup) -> bool:
-        """Whether a detuned group has reached its activation time."""
-        params = group.as_dict()
-        activation_time = self._activation_time_for_detuning(
-            params.get(self.detuning_parameter)
-        )
-        # No time parameter is needed when no activation cutoffs were requested.
-        if activation_time is None:
+    def _group_is_active(self, group: ParameterGroup) -> bool:
+        """Apply intervals, retaining reference groups without detuned counterparts."""
+        if not self.detuning_activation_times:
             return True
+        params = group.as_dict()
+        if self._detunings_match(params.get(self.detuning_parameter), self.non_detuned_value):
+            has_detuned_counterpart = any(
+                not self._detunings_match(
+                    candidate.as_dict().get(self.detuning_parameter), self.non_detuned_value
+                )
+                and all(
+                    candidate.as_dict().get(name) == value
+                    for name, value in params.items()
+                    if name != self.detuning_parameter
+                )
+                for candidate in self.groups
+            )
+            if not has_detuned_counterpart:
+                return True
         try:
             group_time = float(params[self.activation_time_parameter])
         except KeyError as exc:
             raise ValueError(
                 f"Activation time parameter '{self.activation_time_parameter}' was not found in a parameter group."
             ) from exc
-        return group_time >= activation_time
-
-    def _matching_detuned_group_is_active(self, group: ParameterGroup) -> bool:
-        """Whether an active detuned counterpart replaces this reference group."""
-        reference_params = group.as_dict()
-        for candidate in self.groups:
-            candidate_params = candidate.as_dict()
-            if candidate_params.get(self.detuning_parameter) == self.non_detuned_value:
-                continue
-            if all(
-                candidate_params.get(name) == value
-                for name, value in reference_params.items()
-                if name != self.detuning_parameter
-            ) and self._detuned_group_is_active(candidate):
-                return True
-        return False
-
-    def _group_is_active(self, group: ParameterGroup) -> bool:
-        """Whether a group contributes to a final patched momentum profile."""
-        if group.as_dict().get(self.detuning_parameter) != self.non_detuned_value:
-            return self._detuned_group_is_active(group)
-        return not self._matching_detuned_group_is_active(group)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Activation time parameter '{self.activation_time_parameter}' must be numeric."
+            ) from exc
+        if not np.isfinite(group_time):
+            raise ValueError("Activation time parameter must contain finite numeric times.")
+        return any(
+            tmin <= group_time < tmax
+            for detuning, (tmin, tmax) in self.detuning_activation_times.items()
+            if self._detunings_match(detuning, params.get(self.detuning_parameter))
+        )
 
     def remove_bad_images(self) -> List[int]:
         if self.blanks_json is not None:
@@ -2639,8 +2662,7 @@ def run_full_pipeline(
     sort_parameter: Optional[str] = None,
     detuning_parameter: str = "detuning",
     tof_parameter: str = "ToF",
-    non_detuned_value: Any = 12,
-    detuning_activation_times: Optional[Dict[Any, float]] = None,
+    detuning_activation_times: Optional[Dict[Any, Tuple[float, float]]] = None,
     activation_time_parameter: Optional[str] = None,
     two_d: bool = False,
     blanks_json: Optional[str] = None,
@@ -2657,7 +2679,6 @@ def run_full_pipeline(
         sort_parameter=sort_parameter,
         detuning_parameter=detuning_parameter,
         tof_parameter=tof_parameter,
-        non_detuned_value=non_detuned_value,
         detuning_activation_times=detuning_activation_times,
         activation_time_parameter=activation_time_parameter,
         two_d=two_d,

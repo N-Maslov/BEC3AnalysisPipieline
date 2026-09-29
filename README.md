@@ -53,20 +53,29 @@ pipeline = run_full_pipeline(
     sort_parameter="ToF",         # order groups in bad-image GUI
     detuning_parameter="detuning",
     tof_parameter="ToF",
-    non_detuned_value=12,         # default non-detuned value
-    detuning_activation_times={-55: 300},  # use -55 data only at waittime >= 300
+    detuning_activation_times={12: (0, 300), -55: (300, 600), -58: (600, float("inf"))},
     two_d=False,                  # set True for k2d/nk2d input files
 )
 ```
 
-`detuning_activation_times` is optional and maps each detuning to the earliest
-time at which it should contribute. The time parameter defaults to `"waittime"`
-when available (otherwise `sort_parameter`); override it with
-`activation_time_parameter` when your time variable has another name.
-Detunings omitted from the mapping activate at the lowest scheduled time. Before
-a detuning activates, it is excluded from final patched profiles. Once an
-activated detuned profile has the same non-detuning parameters as a reference
-profile, that non-detuned profile is excluded from the final result instead.
+`detuning_activation_times` optionally maps **every detuning to use**, including
+non-detuned data, to a `(tmin, tmax)` interval. A profile contributes when
+`tmin <= time < tmax`. Use `float("-inf")` or `float("inf")` for open-ended
+intervals. Unlisted detunings are excluded; overlapping intervals include both
+profiles, and gaps have no contributing profiles at TOFs with detuned counterparts.
+Non-detuned (reference) profiles remain included regardless of their interval
+when no detuned group has the same TOF, time, and other non-detuning parameters.
+This keeps lower TOFs that were acquired only without detuning. Counterparts
+are checked after parameter exclusions. With no mapping (or `{}`), all profiles
+contribute.
+
+The time parameter defaults to `"waittime"` when available (otherwise
+`sort_parameter`); override it with `activation_time_parameter`.
+The detuning with the earliest interval start is the rescaling reference
+(mapping order breaks ties). Without intervals, the first group's detuning is
+the reference. There is no separate `non_detuned_value` argument. Include the
+reference in the acquired data so other detunings can be compared against it.
+
 All data remain visible in the bad-image, rescaling, and validity-range GUIs;
 series excluded from the final result are labelled accordingly. Averaged profile
 files are retained for every parameter combination.
@@ -97,7 +106,6 @@ pipeline = run_full_pipeline(
     ],
     output_directory="/path/to/combined/Output",
     sort_parameter="waittime",
-    non_detuned_value=6,
 )
 ```
 
@@ -121,11 +129,24 @@ profile manifests also record their contributing sources. Names are optional
 (default `run_1`, `run_2`, etc.) and must be unique.
 
 All results go to the one `output_directory`, including
-`averaged_ds_combined.txt`. Combined `blanks.json` files include the ID mapping
-and can only be reused with the same source mapping. After adding/reordering
-runs or changing the loaded shot set, select blanks again; single-run blanks
-cannot be applied to combined IDs. Existing single-run calls remain supported
-and retain their original image numbers and output names.
+`averaged_ds_combined.txt`. Blank selections are saved as original image numbers,
+grouped by dated set suffix and sub-run name:
+
+```json
+{"sets": {"2026-09-14_S17": {"subruns": {"s17_original": {"blanks": [604, 639]}}}}}
+```
+
+Images are matched by acquisition date and original image number, so adding
+images, moving folders, renaming runs, or reordering runs preserves selections.
+For suffixes without a date, matching uses the suffix and run name instead.
+Existing combined files with `shot_sources` are also supported. Legacy files
+containing only bare image numbers remain supported for single-run loading.
+Missing or ambiguous selected images produce an error instead of selecting a
+different image. Loading in the GUI restores the saved final exclusions as
+manual choices, without restoring old sigma thresholds or an old image cutoff.
+New saves contain only the grouped blank lists, not per-image source maps or
+GUI settings. Existing single-run calls retain their original image numbers
+and output names.
 
 `analysis/GPEB/s17.py` shows this setup with an optional extra acquisition.
 The same `runs` argument is available on `MomentumDistributionPipeline` for
@@ -186,7 +207,6 @@ pipeline = MomentumDistributionPipeline(
     sort_parameter="ToF",
     detuning_parameter="detuning",
     tof_parameter="ToF",
-    non_detuned_value=12,
 )
 
 pipeline.remove_bad_images()

@@ -395,7 +395,7 @@ class MomentumDistribution:
         error = np.sqrt(np.sum(np.square(integration_weights[finite_errors] * nkerr[finite_errors])))
         return float(np.trapz(integrand, k)), float(error)
 
-    def ellsq(self, n0_bar=1500, R=21., L=42., zeta=1.9) -> Tuple[float, float]:
+    def ellsq(self, n0_bar=2.e7, R=21., L=42., zeta=1.9) -> Tuple[float, float]:
         """Return the square of the coherence length and its uncertainty using Gevorg's procedure."""
         V = np.pi * R**2 * L # um^3
         ell0 = V**(1/3) / (zeta**(2/3)-1)**0.5 # um
