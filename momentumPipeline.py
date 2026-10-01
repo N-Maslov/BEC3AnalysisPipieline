@@ -1061,22 +1061,28 @@ class DetuningRescaleGUI:
         self.pairs = self._build_pairs()
         # Saved scales are keyed by detuning value (one scale per detuning).
         self.confirmed_scales: Dict[Any, float] = {}
-        self.pair_idx = 0
-        self.current_scale = 1.0
+        # Each comparison contains all detunings with the same reference
+        # (TOF and every other non-detuning parameter must match).
+        grouped = {}
+        for detuned, reference in self.pairs:
+            grouped.setdefault(reference.group.params, []).append((detuned, reference))
+        self.comparisons = list(grouped.values())
+        self.comparison_idx = 0
+        self.current_scales: Dict[Any, float] = {}
+        self.scale_boxes: Dict[Any, TextBox] = {}
+        self.scale_labels = []
 
-        self.fig, self.ax = plt.subplots(figsize=(12, 8))
-        self.fig.subplots_adjust(bottom=0.31, top=0.92)
+        max_detunings = max((len(group) for group in self.comparisons), default=1)
+        self.fig, self.ax = plt.subplots(figsize=(12, max(8, 3 + 0.6 * max_detunings)))
+        self.fig.subplots_adjust(bottom=0.31, top=0.92, right=0.74)
         self.status_text = self.fig.text(0.06, 0.275, "", color="tab:green")
         self.ax.set_xscale("log")
         self.ax.set_yscale("log")
         self.ax.set_xlabel("k")
         self.ax.set_ylabel("nk")
 
-        # Enter previews a scale. "Save scale & next" persists it globally for
-        # this detuning and advances to the next comparison.
-        self.fig.text(0.06, 0.235, "Scale factor", ha="left", va="bottom")
-        self.scale_box = TextBox(self.fig.add_axes([0.06, 0.17, 0.16, 0.055]), "")
-        self.btn_confirm = Button(self.fig.add_axes([0.25, 0.17, 0.18, 0.055]), "Save scale & next")
+        self.fig.text(0.78, 0.94, "Scale factors (Enter to preview)", fontsize=9)
+        self.btn_confirm = Button(self.fig.add_axes([0.25, 0.17, 0.18, 0.055]), "Confirm")
         self.btn_prev = Button(self.fig.add_axes([0.46, 0.17, 0.10, 0.055]), "Previous")
         self.btn_next = Button(self.fig.add_axes([0.58, 0.17, 0.10, 0.055]), "Next")
         self.btn_exit = Button(self.fig.add_axes([0.72, 0.17, 0.10, 0.055]), "Exit w/o save")
@@ -1100,12 +1106,11 @@ class DetuningRescaleGUI:
 
         # callbacks
         self.btn_confirm.on_clicked(self._confirm_scale)
-        self.btn_prev.on_clicked(self._prev_pair)
-        self.btn_next.on_clicked(self._next_pair)
+        self.btn_prev.on_clicked(self._prev_comparison)
+        self.btn_next.on_clicked(self._next_comparison)
         self.btn_stop.on_clicked(self._stop_pipeline)
         self.btn_exit.on_clicked(self._exit_without_saving)
         self.btn_save.on_clicked(self._save_and_close)
-        self.scale_box.on_submit(lambda txt: self._preview_scale())
         self.btn_apply_limits.on_clicked(self._apply_limits)
         self.btn_reset_limits.on_clicked(self._reset_limits)
         self.btn_load.on_clicked(self._load_scale_factors)
@@ -1136,7 +1141,7 @@ class DetuningRescaleGUI:
                 self.user_ylim = None
         except Exception:
             return
-        self._refresh_plot()
+        self._refresh_plot(keep_preview=True)
 
     def _reset_limits(self, _: Any) -> None:
         # clear text boxes and reset to defaults
@@ -1227,8 +1232,36 @@ class DetuningRescaleGUI:
                 continue
         return None
 
-    def _current_pair(self) -> Tuple[AveragedProfile, AveragedProfile]:
-        return self.pairs[self.pair_idx]
+    def _current_comparison(self) -> List[Tuple[AveragedProfile, AveragedProfile]]:
+        return self.comparisons[self.comparison_idx]
+
+    def _reset_scale_controls(self) -> None:
+        for box in self.scale_boxes.values():
+            box.disconnect_events()
+            box.ax.remove()
+        for label in self.scale_labels:
+            label.remove()
+        self.scale_boxes = {}
+        self.scale_labels = []
+        self.current_scales = {}
+        pairs = self._current_comparison()
+        spacing = min(0.09, 0.59 / len(pairs))
+        for index, (detuned, _) in enumerate(pairs):
+            detuning = detuned.group.as_dict()[self.detuning_parameter]
+            scale = self._confirmed_scale_for_detuning(detuning)
+            if scale is None:
+                scale = self._initial_scale_for_detuning(detuning)
+            self.current_scales[detuning] = scale
+            y = 0.85 - index * spacing
+            color = f"C{(index + 1) % 10}"
+            self.scale_labels.append(self.fig.text(
+                0.78, y + spacing * 0.5, f"{self.detuning_parameter}={detuning}",
+                color=color, fontsize=9,
+            ))
+            box = TextBox(self.fig.add_axes([0.78, y, 0.16, spacing * 0.43]),
+                          "", initial=f"{scale:.6g}")
+            box.on_submit(lambda text: self._preview_scale())
+            self.scale_boxes[detuning] = box
 
     def _refresh_plot(self, keep_preview: bool = False) -> None:
         self.ax.clear()
@@ -1242,56 +1275,36 @@ class DetuningRescaleGUI:
             self.fig.canvas.draw_idle()
             return
 
-        detuned, reference = self._current_pair()
-        detuning_value = detuned.group.as_dict().get(self.detuning_parameter)
-
+        pairs = self._current_comparison()
+        reference = pairs[0][1]
         if not keep_preview:
-            # Prefer a saved value for this detuning; otherwise use an estimate.
-            confirmed_scale = self._confirmed_scale_for_detuning(detuning_value)
-            if confirmed_scale is not None:
-                self.current_scale = confirmed_scale
-            else:
-                self.current_scale = self._initial_scale_for_detuning(detuning_value)
-            self.scale_box.set_val(f"{self.current_scale:.6g}")
+            self._reset_scale_controls()
 
-        scaled_nk = detuned.nk * self.current_scale
-        scaled_err = detuned.stderr * self.current_scale
-
-        # set colors explicitly to avoid duplicate colors
-        ref_color = "tab:blue"
-        det_color = "tab:orange"
         reference_label = "Non-detuned reference"
         if not reference.included_in_final:
             reference_label += " (excluded from final)"
-        self.ax.loglog(reference.k, reference.nk, "o-", ms=3, label=reference_label, color=ref_color)
-        # fill reference errors if available
-        try:
-            if reference.stderr is not None and np.any(np.isfinite(reference.stderr)):
-                ref_err = reference.stderr
-                self.ax.fill_between(reference.k, reference.nk - ref_err, reference.nk + ref_err, color=ref_color, alpha=0.15)
-        except Exception:
-            pass
-        detuned_label = "Detuned (scaled)"
-        if not detuned.included_in_final:
-            detuned_label += " (excluded from final)"
-        self.ax.loglog(detuned.k, scaled_nk, "o-", ms=3, label=detuned_label, color=det_color)
-        self.ax.fill_between(detuned.k, scaled_nk - scaled_err, scaled_nk + scaled_err, color=det_color, alpha=0.2)
+        self.ax.loglog(reference.k, reference.nk, "o-", ms=3,
+                       label=reference_label, color="C0")
+        if reference.stderr is not None:
+            self.ax.fill_between(reference.k, reference.nk - reference.stderr,
+                                 reference.nk + reference.stderr, color="C0", alpha=0.15)
+        for index, (detuned, _) in enumerate(pairs):
+            detuning = detuned.group.as_dict()[self.detuning_parameter]
+            scale = self.current_scales[detuning]
+            scaled_nk = detuned.nk * scale
+            color = f"C{(index + 1) % 10}"
+            label = f"{self.detuning_parameter}={detuning} (×{scale:.6g})"
+            if not detuned.included_in_final:
+                label += " (excluded from final)"
+            self.ax.loglog(detuned.k, scaled_nk, "o-", ms=3, label=label, color=color)
+            if detuned.stderr is not None:
+                scaled_err = detuned.stderr * scale
+                self.ax.fill_between(detuned.k, scaled_nk - scaled_err,
+                                     scaled_nk + scaled_err, color=color, alpha=0.2)
 
-        # initialize default axis limits if not set
-        if self._default_xlim is None:
-            try:
-                xmin = min(np.nanmin(reference.k), np.nanmin(detuned.k))
-                xmax = max(np.nanmax(reference.k), np.nanmax(detuned.k))
-                self._default_xlim = (xmin, xmax)
-            except Exception:
-                self._default_xlim = (None, None)
-        if self._default_ylim is None:
-            try:
-                ymin = min(np.nanmin(reference.nk), np.nanmin(scaled_nk))
-                ymax = max(np.nanmax(reference.nk), np.nanmax(scaled_nk))
-                self._default_ylim = (ymin, ymax)
-            except Exception:
-                self._default_ylim = (None, None)
+        profiles = [reference] + [pair[0] for pair in pairs]
+        self._default_xlim = (min(np.nanmin(profile.k) for profile in profiles),
+                              max(np.nanmax(profile.k) for profile in profiles))
 
         # apply any user-specified limits in text boxes if present
         try:
@@ -1315,45 +1328,49 @@ class DetuningRescaleGUI:
         except Exception:
             pass
 
-        title = ", ".join(f"{k}={v}" for k, v in detuned.group.as_dict().items())
-        self.ax.set_title(f"Pair {self.pair_idx + 1}/{len(self.pairs)} | {title}")
+        title = ", ".join(f"{k}={v}" for k, v in reference.group.params
+                          if k != self.detuning_parameter)
+        self.ax.set_title(f"Comparison {self.comparison_idx + 1}/{len(self.comparisons)} | {title}")
         self.ax.legend(loc="best")
         self.fig.canvas.draw_idle()
 
-    def _preview_scale(self) -> None:
-        if not self.pairs:
-            return
+    def _preview_scale(self) -> bool:
+        if not self.comparisons:
+            return False
         try:
-            text = self.scale_box.text.strip()
-            value = float(text)
-        except Exception:
-            return
-        if value <= 0:
-            raise ValueError("Scale factor must be positive.")
-        self.current_scale = value
+            scales = {detuning: float(box.text.strip())
+                      for detuning, box in self.scale_boxes.items()}
+            if any(not np.isfinite(value) or value <= 0 for value in scales.values()):
+                raise ValueError
+        except ValueError:
+            self.status_text.set_text("Scale factors must be finite, positive numbers.")
+            self.status_text.set_color("tab:red")
+            self.fig.canvas.draw_idle()
+            return False
+        self.current_scales = scales
+        self.status_text.set_text("Preview — press Confirm to save these factors.")
+        self.status_text.set_color("tab:green")
         self._refresh_plot(keep_preview=True)
+        return True
 
     def _confirm_scale(self, _: Any) -> None:
-        if not self.pairs:
+        if not self._preview_scale():
             return
-        self._preview_scale()
-        detuned, _ = self._current_pair()
-        detuning_value = detuned.group.as_dict().get(self.detuning_parameter)
-        self.confirmed_scales[detuning_value] = self.current_scale
-        if self.pair_idx < len(self.pairs) - 1:
-            self.pair_idx += 1
-        self._refresh_plot()
+        self.confirmed_scales.update(self.current_scales)
+        self.status_text.set_text("Confirmed factors for all displayed detunings (shared across TOFs).")
+        self.fig.canvas.draw_idle()
 
-    def _prev_pair(self, _: Any) -> None:
-        if not self.pairs:
-            return
-        self.pair_idx = (self.pair_idx - 1) % len(self.pairs)
-        self._refresh_plot()
+    def _prev_comparison(self, _: Any) -> None:
+        self._move_comparison(-1)
 
-    def _next_pair(self, _: Any) -> None:
-        if not self.pairs:
+    def _next_comparison(self, _: Any) -> None:
+        self._move_comparison(1)
+
+    def _move_comparison(self, step: int) -> None:
+        if not self.comparisons:
             return
-        self.pair_idx = (self.pair_idx + 1) % len(self.pairs)
+        self.comparison_idx = (self.comparison_idx + step) % len(self.comparisons)
+        self.status_text.set_text("")
         self._refresh_plot()
 
     def _load_scale_factors(self, _: Any) -> None:
@@ -1395,19 +1412,8 @@ class DetuningRescaleGUI:
                 if factor is not None:
                     matched_factors[detuning] = factor
             self.confirmed_scales = matched_factors
-            current_factor: Optional[float] = None
-            if self.pairs:
-                current_detuning = self._current_pair()[0].group.as_dict().get(
-                    self.detuning_parameter
-                )
-                current_factor = self._confirmed_scale_for_detuning(current_detuning)
-                if current_factor is not None:
-                    self.current_scale = current_factor
-                    self.scale_box.set_val(f"{current_factor:.6g}")
-            self._refresh_plot(keep_preview=current_factor is not None)
+            self._refresh_plot()
             message = f"Loaded {len(matched_factors)} matching detuning scale factor(s)."
-            if current_factor is not None:
-                message += f" Current factor: {current_factor:.6g}."
             self.status_text.set_text(message)
             self.status_text.set_color("tab:green")
             self.fig.canvas.draw_idle()
