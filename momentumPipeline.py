@@ -246,6 +246,8 @@ class AveragedProfile:
     n_shots_per_point: np.ndarray
     scale_factor: float = 1.0
     included_in_final: bool = True
+    # Original sampling for each shot, retained for final within-shot binning.
+    shot_profiles: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None
 
 
 def _to_python_scalar(value: Any) -> Any:
@@ -2167,9 +2169,7 @@ def _patch_profiles(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Use the lowest-TOF valid sampling grid available in each k range."""
     all_k: List[float] = []
-    all_nk: List[float] = []
-    all_err: List[float] = []
-    all_repetitions: List[int] = []
+    contributing_profiles = []
     grids_by_tof: Dict[float, List[np.ndarray]] = {}
 
     for profile in profiles:
@@ -2220,17 +2220,11 @@ def _patch_profiles(
                 np.unique(profile.k[order[run]]) for run in runs
             )
         all_k.extend(profile.k[valid].tolist())
-        all_nk.extend(profile.nk[valid].tolist())
-        all_err.extend(profile.stderr[valid].tolist())
-        all_repetitions.extend(profile.n_shots_per_point[valid].tolist())
+        if np.any(valid):
+            contributing_profiles.append((profile, k_low, k_high))
 
     if not all_k:
         raise ValueError("No valid points available after applying patch validity ranges.")
-
-    k_arr = np.asarray(all_k, dtype=float)
-    nk_arr = np.asarray(all_nk, dtype=float)
-    err_arr = np.asarray(all_err, dtype=float)
-    repetition_arr = np.asarray(all_repetitions, dtype=float)
 
     reference_grids = []
     covered_ranges = []
@@ -2248,44 +2242,40 @@ def _patch_profiles(
     centers = np.unique(np.concatenate(reference_grids))
     num_bins = centers.size
     boundaries = centers[:-1] + np.diff(centers) / 2.0
-    # Assign to the nearest reference k, with midpoint ties going to the
-    # higher bin. The stitched grid spans all contributing TOFs' valid data.
-    bin_ids = np.searchsorted(boundaries, k_arr, side="right")
+    # Preserve shot identity: multiple momentum samples from one shot yield
+    # one value, regardless of that shot's sampling density.
+    values_by_bin: List[List[float]] = [[] for _ in range(num_bins)]
+    for profile, k_low, k_high in contributing_profiles:
+        if profile.shot_profiles is None:
+            raise ValueError(
+                "Final binning requires individual shot profiles; recompute averaged profiles."
+            )
+        for shot_k, shot_nk in profile.shot_profiles:
+            shot_k = np.asarray(shot_k, dtype=float)
+            shot_nk = np.asarray(shot_nk, dtype=float)
+            valid = (
+                np.isfinite(shot_k) & np.isfinite(shot_nk)
+                & (shot_k > 0) & (shot_k >= k_low) & (shot_k <= k_high)
+            )
+            # Midpoint ties belong to the higher bin, as before.
+            bin_ids = np.searchsorted(boundaries, shot_k[valid], side="right")
+            counts = np.bincount(bin_ids, minlength=num_bins)
+            sums = np.bincount(bin_ids, weights=shot_nk[valid], minlength=num_bins)
+            for bin_idx in np.flatnonzero(counts):
+                values_by_bin[bin_idx].append(float(sums[bin_idx] / counts[bin_idx]))
 
     out_k: List[float] = []
     out_nk: List[float] = []
     out_err: List[float] = []
     out_count: List[int] = []
-
-    for bin_idx in range(num_bins):
-        in_bin = bin_ids == bin_idx
-        if not np.any(in_bin):
+    for bin_idx, values in enumerate(values_by_bin):
+        if not values:
             continue
-        means = nk_arr[in_bin]
-        errors = err_arr[in_bin]
-        repetitions = repetition_arr[in_bin]
-        if means.size == 1:
-            # A single averaged k point already has the experimental mean
-            # and standard error; do not estimate its error from k scatter.
-            mean = float(means[0])
-            combined_err = float(errors[0])
-        else:
-            # Recover the statistics of all underlying measurements from
-            # their sufficient statistics. SEM_i = sample_std_i / sqrt(n_i).
-            # Each original measurement has equal weight, including all k
-            # samples contributed by the more finely sampled longer TOFs.
-            sample_count = float(np.sum(repetitions))
-            mean = float(np.sum(repetitions * means) / sample_count)
-            within_ss = np.sum(errors**2 * repetitions * (repetitions - 1))
-            between_ss = np.sum(repetitions * (means - mean)**2)
-            sample_variance = (within_ss + between_ss) / (sample_count - 1)
-            # More k samples do not mean more experimental repetitions.
-            combined_err = float(np.sqrt(sample_variance / np.max(repetitions)))
-
+        count = len(values)
         out_k.append(float(centers[bin_idx]))
-        out_nk.append(mean)
-        out_err.append(combined_err)
-        out_count.append(int(np.sum(in_bin)))
+        out_nk.append(float(np.mean(values)))
+        out_err.append(float(np.std(values, ddof=1) / np.sqrt(count)) if count > 1 else 0.0)
+        out_count.append(count)
 
     return (
         np.array(out_k, dtype=float),
@@ -2568,6 +2558,7 @@ class MomentumDistributionPipeline:
                 nk=nk_vals,
                 stderr=stderr_vals,
                 n_shots_per_point=n_counts,
+                shot_profiles=[(k.copy(), nk.copy()) for k, nk in profiles],
                 included_in_final=self._group_is_active(group),
             )
             averaged_profiles.append(averaged_profile)
@@ -2684,6 +2675,10 @@ class MomentumDistributionPipeline:
                 stderr=np.copy(profile.stderr) * factor,
                 n_shots_per_point=np.copy(profile.n_shots_per_point),
                 scale_factor=factor,
+                shot_profiles=(
+                    [(k.copy(), nk * factor) for k, nk in profile.shot_profiles]
+                    if profile.shot_profiles is not None else None
+                ),
                 included_in_final=profile.included_in_final,
             )
             rescaled_profiles.append(scaled_profile)
