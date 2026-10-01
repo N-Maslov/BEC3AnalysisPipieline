@@ -28,7 +28,6 @@ run_full_pipeline(run_parameters=run_params,
                 sort_parameter="waittime", 
                 detuning_parameter="detuning", 
                 tof_parameter="ToF", 
-                non_detuned_value=12
                 )
 '''
 pipeline = MomentumDistributionPipeline(
@@ -39,7 +38,6 @@ pipeline = MomentumDistributionPipeline(
     sort_parameter="waittime",
     detuning_parameter="detuning",
     tof_parameter="ToF",
-    non_detuned_value=12,
 )
 
 pipeline.remove_bad_images()

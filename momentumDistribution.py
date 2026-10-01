@@ -89,20 +89,31 @@ class MomentumDistribution:
         k_cutoff: float,
         subtraction: bool = False
     ) -> Tuple[float, float]:
-        """Return the weighted overlap and its propagated uncertainty.
+        """Return the normalized square-root overlap and its uncertainty.
 
-        This evaluates
-        ``integral_0^k_cutoff w(k) * min(n1(k)/N1, n2(k)/N2) dk``, where
-        ``N1`` and ``N2`` are each distribution's total atom number.  The
-        profiles are linearly interpolated onto their combined sampled
-        momenta, including the requested cutoff when it lies between samples.
-        Integration begins at the later of the two profiles' first measured
-        non-negative momentum values, so neither profile is extrapolated
-        below its data.  Both profiles must extend through ``k_cutoff``.
+        With ``subtraction=False``, evaluate ``integral w*sqrt(p1*p2) dk``,
+        where ``pi = ni / integral w*ni dk``. All three integrals use the
+        same combined, linearly interpolated grid, starting at the later
+        first non-negative sample and ending at ``k_cutoff``. Both profiles
+        must extend through the cutoff. Negative measured nk values are
+        clipped to zero before interpolation, for both the overlap and its
+        normalizations; stored data are unchanged. Weights must be
+        non-negative, with positive weighted normalizations. For
+        ``w=4*pi*k**2``, the normalizations are atom numbers in this range.
+        The overlap is in [0, 1]; any profile compared with itself gives 1.
 
-        The uncertainty includes both ``nk`` and total-atom-number errors in
-        ``nk / N``.  The error of the selected integrand is integrated with
-        the trapezoidal weights and combined in quadrature.
+        Errors use first-order propagation from independent original nk
+        samples, including covariance introduced by interpolation and by
+        normalization. Distinct objects are assumed independent. Self
+        comparison returns zero error. Clipped negative samples have zero
+        local derivative and contribute no first-order error. At a zero density with nonzero
+        uncertainty and nonzero weight the square-root derivative is
+        undefined, so the returned error is NaN (except self comparison).
+        First-order errors may underestimate uncertainty near overlap 1.
+
+        ``subtraction=True`` retains the legacy weighted absolute difference
+        of profiles normalized by their full-range total atom numbers,
+        together with its approximate uncertainty propagation.
         """
         if not isinstance(other, MomentumDistribution):
             raise TypeError("other must be a MomentumDistribution.")
@@ -113,16 +124,29 @@ class MomentumDistribution:
 
         self_k, self_nk, self_nkerr = self._profile_for_overlap(k_cutoff)
         other_k, other_nk, other_nkerr = other._profile_for_overlap(k_cutoff)
-        atom_number, atom_number_err = self.total_atom_number()
-        other_atom_number, other_atom_number_err = other.total_atom_number()
-        if atom_number == 0 or other_atom_number == 0:
-            raise ValueError("Both distributions must have non-zero total atom number.")
-
         lower_bound = max(self_k[0], other_k[0])
         k = np.union1d(self_k, other_k)
         k = k[k >= lower_bound]
         self_nk = np.interp(k, self_k, self_nk)
         other_nk = np.interp(k, other_k, other_nk)
+        weight = np.asarray(weighting_function(k), dtype=float)
+        if weight.ndim == 0:
+            weight = np.full_like(k, weight)
+        elif weight.shape != k.shape:
+            raise ValueError("weighting_function must return a scalar or one value per k.")
+        if not np.all(np.isfinite(weight)):
+            raise ValueError("weighting_function must return finite values.")
+
+        if k.size < 2:
+            raise ValueError("The shared integration range must have positive width.")
+        if not subtraction:
+            return self._square_root_overlap(other, k, weight)
+
+        atom_number, atom_number_err = self.total_atom_number()
+        other_atom_number, other_atom_number_err = other.total_atom_number()
+        if atom_number == 0 or other_atom_number == 0:
+            raise ValueError("Both distributions must have non-zero total atom number.")
+
         normalized_self = self_nk / atom_number
         normalized_other = other_nk / other_atom_number
         normalized_self_err = np.hypot(
@@ -133,27 +157,10 @@ class MomentumDistribution:
             np.interp(k, other_k, other_nkerr) / other_atom_number,
             other_nk * other_atom_number_err / other_atom_number**2,
         )
-        weight = np.asarray(weighting_function(k), dtype=float)
-        if weight.ndim == 0:
-            weight = np.full_like(k, weight)
-        elif weight.shape != k.shape:
-            raise ValueError("weighting_function must return a scalar or one value per k.")
-        if not np.all(np.isfinite(weight)):
-            raise ValueError("weighting_function must return finite values.")
-
-        if subtraction:
-            integrand = weight * np.abs(normalized_self - normalized_other)
-            integrand_err = np.abs(weight) * np.hypot(
-                normalized_self_err, normalized_other_err
-            )
-        else:
-            self_is_minimum = normalized_self <= normalized_other
-            integrand = weight * np.where(
-                self_is_minimum, normalized_self, normalized_other
-            )
-            integrand_err = np.abs(weight) * np.where(
-                self_is_minimum, normalized_self_err, normalized_other_err
-            )
+        integrand = weight * np.abs(normalized_self - normalized_other)
+        integrand_err = np.abs(weight) * np.hypot(
+            normalized_self_err, normalized_other_err
+        )
 
         trapezoid_weights = np.empty_like(k)
         trapezoid_weights[0] = (k[1] - k[0]) / 2.0
@@ -161,6 +168,64 @@ class MomentumDistribution:
         trapezoid_weights[1:-1] = (k[2:] - k[:-2]) / 2.0
         error = np.sqrt(np.sum(np.square(trapezoid_weights * integrand_err)))
         return float(np.trapz(integrand, k)), float(error)
+
+    def _square_root_overlap(self, other, k, weight) -> Tuple[float, float]:
+        """Propagate the normalized overlap back to original measured bins."""
+        if np.any(weight < 0):
+            raise ValueError("Square-root overlap requires non-negative weights.")
+        trapezoid_weights = np.empty_like(k)
+        trapezoid_weights[0] = (k[1] - k[0]) / 2.0
+        trapezoid_weights[-1] = (k[-1] - k[-2]) / 2.0
+        trapezoid_weights[1:-1] = (k[2:] - k[:-2]) / 2.0
+        q = trapezoid_weights * weight
+
+        def interpolate(distribution):
+            valid = np.isfinite(distribution.k) & np.isfinite(distribution.nk)
+            valid &= distribution.k >= 0
+            order = np.argsort(distribution.k[valid])
+            source_k = distribution.k[valid][order]
+            source_n = distribution.nk[valid][order]
+            source_err = distribution.nkerr[valid][order]
+            right = np.clip(np.searchsorted(source_k, k, side="right"), 1, len(source_k) - 1)
+            left = right - 1
+            fraction = (k - source_k[left]) / (source_k[right] - source_k[left])
+            # Retain the interpolation map so shared source bins are not
+            # counted as independent errors on the combined grid.
+            matrix = np.zeros((len(k), len(source_k)))
+            matrix[np.arange(len(k)), left] = 1.0 - fraction
+            matrix[np.arange(len(k)), right] = fraction
+            used = np.any(matrix[q > 0] != 0, axis=0)
+            if np.any(~np.isfinite(source_err[used])) or np.any(source_err[used] < 0):
+                raise ValueError("Overlap requires finite, non-negative nk errors.")
+            # Apply the same clipping to numerator and normalization. Below
+            # zero, clipping is locally constant, so its derivative is zero.
+            source_err = np.where(source_n < 0, 0.0, source_err)
+            source_n = np.maximum(source_n, 0.0)
+            return matrix[q > 0][:, used], source_n[used], source_err[used]
+
+        matrix1, samples1, errors1 = interpolate(self)
+        matrix2, samples2, errors2 = interpolate(other)
+        q = q[q > 0]
+        n1, n2 = matrix1 @ samples1, matrix2 @ samples2
+        N1, N2 = q @ n1, q @ n2
+        if not np.isfinite(N1) or not np.isfinite(N2) or N1 <= 0 or N2 <= 0:
+            raise ValueError("Both distributions must have positive finite weighted normalization.")
+        if self is other:
+            return 1.0, 0.0
+        p1, p2 = n1 / N1, n2 / N2
+        overlap = float(np.clip(q @ (np.sqrt(p1) * np.sqrt(p2)), 0.0, 1.0))
+        uncertain_zero1 = (n1 == 0) & np.any(matrix1[:, errors1 > 0] != 0, axis=1)
+        uncertain_zero2 = (n2 == 0) & np.any(matrix2[:, errors2 > 0] != 0, axis=1)
+        if np.any(uncertain_zero1 | uncertain_zero2):
+            return overlap, float("nan")
+        # Differentiate numerator and normalization together. Fixed zeros
+        # have no noise contribution and need no square-root derivative.
+        ratio1 = np.sqrt(np.divide(p2, p1, out=np.zeros_like(p1), where=p1 > 0))
+        ratio2 = np.sqrt(np.divide(p1, p2, out=np.zeros_like(p2), where=p2 > 0))
+        gradient1 = matrix1.T @ (q * (ratio1 - overlap) / (2.0 * N1))
+        gradient2 = matrix2.T @ (q * (ratio2 - overlap) / (2.0 * N2))
+        error = np.sqrt(np.sum((gradient1 * errors1)**2) + np.sum((gradient2 * errors2)**2))
+        return overlap, float(error)
 
     def k_p(self, max_k: Optional[float] = None) -> float:
         """Return the sampled momentum where ``k**2 * nk`` is largest.

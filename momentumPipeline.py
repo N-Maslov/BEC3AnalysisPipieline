@@ -5,8 +5,9 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from math import ceil, sqrt
+from numbers import Integral
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -44,6 +45,7 @@ class _CombinedImageProcessing(ImageProcessing):
         run_names = [run.name or f"run_{index + 1}" for index, run in enumerate(runs)]
         if len(set(run_names)) != len(run_names):
             raise ValueError("PipelineRun names must be unique.")
+        self.run_names = run_names
         for run in runs:
             if set(run.run_parameters.variable_names) != set(names):
                 raise ValueError("All runs must declare the same parameter names (values and ordering may differ).")
@@ -91,6 +93,48 @@ class _CombinedImageProcessing(ImageProcessing):
         calc = shot["calc"].copy()
         calc["ImageNumber"] = shot_id
         return {"k": shot["k"], "nk": shot["nk"], "calc": calc}
+
+
+# Tuples specify inclusive endpoints; Python ranges retain their normal semantics.
+BlankSelection = Iterable[Union[int, Tuple[int, int], range]]
+BlanksArgument = Union[BlankSelection, Dict[str, BlankSelection]]
+
+
+def _resolve_blanks(blanks: Optional[BlanksArgument], image_processing: ImageProcessing) -> List[int]:
+    """Resolve original acquisition numbers to the pipeline's image IDs."""
+    if blanks is None:
+        return []
+
+    def expand(selection: BlankSelection) -> set[int]:
+        numbers = set()
+        for item in selection:
+            if isinstance(item, Integral) and not isinstance(item, bool):
+                numbers.add(int(item))
+            elif isinstance(item, range):
+                numbers.update(item)
+            elif (isinstance(item, tuple) and len(item) == 2
+                  and all(isinstance(n, Integral) and not isinstance(n, bool) for n in item)):
+                first, last = item
+                if first > last:
+                    raise ValueError("Blank range start must not exceed its end.")
+                numbers.update(range(first, last + 1))
+            else:
+                raise ValueError("blanks entries must be integers, (first, last) tuples, or range objects.")
+        return numbers
+
+    if hasattr(image_processing, "sources"):
+        if not isinstance(blanks, dict):
+            raise ValueError("With runs, blanks must map PipelineRun names to original image selections.")
+        known_names = set(image_processing.run_names)
+        unknown = set(blanks) - known_names
+        if unknown:
+            raise ValueError(f"Unknown run names in blanks: {sorted(unknown)}")
+        selections = {name: expand(selection) for name, selection in blanks.items()}
+        return sorted(int(number) for number, source in image_processing.sources.items()
+                      if source["image_number"] in selections.get(source["run"], set()))
+    if isinstance(blanks, dict):
+        raise ValueError("For a single-run pipeline, blanks must be an iterable of image selections.")
+    return sorted(expand(blanks) & set(image_processing.inums))
 
 
 def _blank_sources(image_processing: ImageProcessing) -> Dict[str, Any]:
@@ -445,6 +489,7 @@ class BadImageSelectionGUI:
         groups: Sequence[ParameterGroup],
         output_dir: Path,
         excluded_from_final_group_keys: Optional[Iterable[str]] = None,
+        initial_blanks: Optional[Iterable[int]] = None,
     ):
         self.image_processing = image_processing
         self.groups = list(groups)
@@ -454,7 +499,7 @@ class BadImageSelectionGUI:
         self.excluded_from_final_group_keys = set(excluded_from_final_group_keys or ())
 
         self.group_idx = 0
-        self.manual_blanks: set[int] = set()
+        self.manual_blanks: set[int] = set(initial_blanks or ())
         # A manual include takes precedence over a sigma-based exclusion.  Keep
         # this separately from manual_blanks so clicking an auto-blanked shot
         # can restore it without changing the current sigma thresholds.
@@ -644,7 +689,13 @@ class BadImageSelectionGUI:
     def _calc_sigma_blanks(self, group: ParameterGroup, low_sigma: float, high_sigma: float) -> set[int]:
         n_values: List[float] = []
         e_values: List[float] = []
-        run_numbers = list(group.run_numbers)
+        # Known exclusions must not bias either statistic. Automatic outliers
+        # remain in this population so recalculation is a single sigma pass,
+        # rather than progressively clipping more shots on every GUI action.
+        run_numbers = [inum for inum in group.run_numbers
+                       if inum not in self.manual_blanks and inum <= self.max_image_number]
+        if len(run_numbers) < 2:
+            return set()
         for inum in run_numbers:
             calc = self.image_processing[inum]["calc"]
             n_values.append(float(calc["N"]))
@@ -810,14 +861,15 @@ class BadImageSelectionGUI:
             return
         if inum in self._cutoff_blanks():
             return
-        auto_blanks = set().union(*self.sigma_blanks_by_group.values())
         if inum in self._effective_blanks():
             self.manual_blanks.discard(inum)
-            if inum in auto_blanks:
-                self.manual_includes.add(inum)
+            # Restoring a known blank changes the reference population and may
+            # make this shot an automatic outlier. Honor the explicit include.
+            self.manual_includes.add(inum)
         else:
             self.manual_blanks.add(inum)
             self.manual_includes.discard(inum)
+        self._recalculate_sigma_blanks()
         self._refresh_plot()
 
     def _on_sigma_changed(self, _: float) -> None:
@@ -830,6 +882,7 @@ class BadImageSelectionGUI:
 
     def _on_max_image_changed(self, value: float) -> None:
         self.max_image_number = int(round(value))
+        self._recalculate_sigma_blanks()
         self._refresh_plot()
 
     @staticmethod
@@ -907,6 +960,7 @@ class BadImageSelectionGUI:
         for inum in group.run_numbers:
             self.manual_blanks.discard(inum)
             self.manual_includes.discard(inum)
+        self._recalculate_sigma_blanks()
         self._refresh_plot()
 
     def _reset_all(self, _: Any) -> None:
@@ -2252,6 +2306,7 @@ class MomentumDistributionPipeline:
         activation_time_parameter: Optional[str] = None,
         two_d: bool = False,
         blanks_json: Optional[str] = None,
+        blanks: Optional[BlanksArgument] = None,
         detuning_rescale_factors_json: Optional[str] = None,
         patch_validity_ranges_json: Optional[str] = None,
         excluded_parameter_combinations: Optional[Sequence[Dict[str, Any]]] = None,
@@ -2328,7 +2383,7 @@ class MomentumDistributionPipeline:
             group for group in self.groups if self._group_is_active(group)
         ]
 
-        self.blanks: List[int] = []
+        self.blanks: List[int] = _resolve_blanks(blanks, self.image_processing)
         self.averaged_profiles: List[AveragedProfile] = []
         self.rescaled_profiles: List[AveragedProfile] = []
         self.patch_ranges: Dict[str, Tuple[float, float]] = {}
@@ -2339,7 +2394,9 @@ class MomentumDistributionPipeline:
 
         if blanks_json is not None:
             blanks_payload = _load_json_file(blanks_json, "blanks")
-            self.blanks = _load_blank_numbers(blanks_payload, self.image_processing)
+            self.blanks = sorted(set(self.blanks) | set(
+                _load_blank_numbers(blanks_payload, self.image_processing)
+            ))
 
         if detuning_rescale_factors_json is not None:
             factors_payload = _load_json_file(
@@ -2471,6 +2528,7 @@ class MomentumDistributionPipeline:
             image_processing=self.image_processing,
             groups=self.groups,
             output_dir=self.output_directory,
+            initial_blanks=self.blanks,
             excluded_from_final_group_keys={
                 group.key for group in self.groups if not self._group_is_active(group)
             },
@@ -2703,6 +2761,7 @@ def run_full_pipeline(
     activation_time_parameter: Optional[str] = None,
     two_d: bool = False,
     blanks_json: Optional[str] = None,
+    blanks: Optional[BlanksArgument] = None,
     detuning_rescale_factors_json: Optional[str] = None,
     patch_validity_ranges_json: Optional[str] = None,
     excluded_parameter_combinations: Optional[Sequence[Dict[str, Any]]] = None,
@@ -2721,6 +2780,7 @@ def run_full_pipeline(
         activation_time_parameter=activation_time_parameter,
         two_d=two_d,
         blanks_json=blanks_json,
+        blanks=blanks,
         detuning_rescale_factors_json=detuning_rescale_factors_json,
         patch_validity_ranges_json=patch_validity_ranges_json,
         excluded_parameter_combinations=excluded_parameter_combinations,

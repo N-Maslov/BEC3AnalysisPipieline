@@ -255,6 +255,43 @@ pipeline.select_patch_validity_ranges()
 pipeline.patch_tofs_and_detunings()
 ```
 
+## Marking known blanks in bulk
+
+Both `run_full_pipeline` and `MomentumDistributionPipeline` accept `blanks`.
+For the single-run arguments (`data_directory`, `data_suffix`, `run_parameters`),
+pass original image numbers and inclusive `(first, last)` tuples:
+
+```python
+blanks=[604, (700, 799), (900, 920)],
+```
+
+This marks image 604, all 100 images from 700 through 799, and 900 through 920.
+Python ranges also work: `blanks=range(700, 800)` or
+`blanks=[604, range(700, 800)]`.
+
+When using `runs=[PipelineRun(...), ...]`, even with only one run, use a mapping
+from run names to selections. These are **original image numbers**, not combined
+shot IDs:
+
+```python
+blanks={"s18_original": [(1700, 1799), 1850]},
+```
+
+Unnamed runs use `run_1`, `run_2`, etc. Unknown run names and reversed tuple
+ranges raise an error. Image numbers absent from the loaded data are ignored.
+The acquisition schedule is preserved; blanking does not shift parameter assignments.
+
+Selections apply immediately when computing averages and are preselected in the
+bad-image GUI, where you can still change them. Known blanks (including manual
+selections and images beyond **Max image**) are excluded from the atom-number
+and energy mean/standard-deviation calculations used for automatic filtering.
+These statistics update when you change the exclusions. Automatic outliers are
+not repeatedly removed from the statistics; filtering remains a single sigma pass.
+With fewer than two eligible shots in a group, no automatic exclusions are made.
+Saving that GUI includes them in
+`blanks.json`. If `blanks_json` is also supplied, these selections are added to
+its saved blanks and the bad-image GUI is skipped as usual.
+
 ## Reusing completed stages
 
 Pass any saved JSON result back to the pipeline to skip its corresponding GUI.
