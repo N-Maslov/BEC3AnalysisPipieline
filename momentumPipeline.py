@@ -3,7 +3,7 @@ import json
 import re
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import ceil, sqrt
 from numbers import Integral
 from pathlib import Path
@@ -12,7 +12,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.lines import Line2D
-from matplotlib.widgets import Button, Slider, TextBox
+from matplotlib.widgets import Button, Slider, TextBox, CheckButtons, RangeSlider
 
 from imageProcessing import ImageProcessing
 from runParameters import RunParameters
@@ -1038,6 +1038,82 @@ class BadImageSelectionGUI:
         return self._effective_blanks()
 
 
+def _default_detuning_selections(profiles):
+    selections = {}
+    for profile in profiles:
+        k = profile.k[np.isfinite(profile.k) & (profile.k > 0)]
+        if k.size:
+            selections[profile.group.key] = {
+                "enabled": bool(profile.included_in_final),
+                "k_min": float(k.min()), "k_max": float(k.max()),
+            }
+    return selections
+
+
+def _read_detuning_settings(payload):
+    """Accept both legacy factor-only files and versioned selection files."""
+    if not isinstance(payload, dict):
+        raise ValueError("Detuning settings must be a JSON object.")
+    factors = {str(k): float(v) for k, v in payload.get("scale_factors", payload).items()}
+    if any(not np.isfinite(v) or v <= 0 for v in factors.values()):
+        raise ValueError("Scale factors must be finite and positive.")
+    selections = payload.get("selections", {}) if "scale_factors" in payload else {}
+    if not isinstance(selections, dict):
+        raise ValueError("Detuning selections must be a mapping.")
+    validated = {}
+    for key, item in selections.items():
+        if (not isinstance(item, dict) or not isinstance(item.get("enabled"), bool)
+                or "k_min" not in item or "k_max" not in item):
+            raise ValueError("Each detuning selection requires an enabled boolean.")
+        low, high = float(item["k_min"]), float(item["k_max"])
+        if not np.isfinite([low, high]).all() or not 0 < low <= high:
+            raise ValueError("Detuning k ranges must be finite, positive and ordered.")
+        validated[key] = {"enabled": item["enabled"], "k_min": low, "k_max": high}
+    return factors, validated
+
+
+def _combine_largest_tof(profiles, selections, tof_parameter, detuning_parameter,
+                         reference_detuning):
+    """Pool selected shots at the largest TOF, retaining them for final binning."""
+    result = []
+    for _, members in _group_for_patching(profiles, tof_parameter, detuning_parameter):
+        largest = max(float(p.group.as_dict()[tof_parameter]) for p in members)
+        selected, ranges, shots = [], {}, []
+        largest_members = []
+        for profile in members:
+            if float(profile.group.as_dict()[tof_parameter]) != largest:
+                result.append(profile)
+                continue
+            largest_members.append(profile)
+            setting = selections[profile.group.key]
+            if not setting["enabled"]:
+                continue
+            low, high = setting["k_min"], setting["k_max"]
+            masked_shots = []
+            if profile.shot_profiles is None:
+                raise ValueError("Combining detunings requires individual shot profiles; recompute averages.")
+            for k, nk in profile.shot_profiles:
+                mask = (k >= low) & (k <= high)
+                masked_shots.append((k[mask].copy(), nk[mask].copy()))
+            selected.append(replace(profile, included_in_final=True, shot_profiles=masked_shots))
+            shots.extend(masked_shots)
+            ranges[_patch_range_key(profile.group.as_dict(), tof_parameter, detuning_parameter)] = (low, high)
+        if not selected:
+            continue
+        try:
+            k, nk, err, counts = _patch_profiles(selected, ranges, tof_parameter, detuning_parameter)
+        except ValueError as exc:
+            if str(exc).startswith("No valid points"):
+                continue
+            raise
+        params = tuple((name, reference_detuning if name == detuning_parameter else value)
+                       for name, value in largest_members[0].group.params)
+        numbers = [n for profile in selected for n in profile.run_numbers]
+        result.append(AveragedProfile(ParameterGroup(params, tuple(numbers)), numbers,
+                                      k, nk, err, counts, shot_profiles=shots))
+    return result
+
+
 class DetuningRescaleGUI:
     def __init__(
         self,
@@ -1046,7 +1122,9 @@ class DetuningRescaleGUI:
         non_detuned_value: Any,
         output_dir: Path,
         sort_parameter: Optional[str] = None,
+        tof_parameter: str = "ToF",
     ):
+        self.tof_parameter = tof_parameter
         self.detuning_parameter = detuning_parameter
         self.non_detuned_value = non_detuned_value
         self.output_dir = output_dir
@@ -1054,6 +1132,9 @@ class DetuningRescaleGUI:
         self.stop_pipeline = False
         self.all_profiles = list(averaged_profiles)
         self.sort_parameter = sort_parameter
+        self.selections = _default_detuning_selections(self.all_profiles)
+        self.selection_widgets = []
+        self.selection_controls = {}
 
         # map profile params -> profile for lookup
         self.profile_map: Dict[Tuple[Tuple[str, Any], ...], AveragedProfile] = {
@@ -1068,22 +1149,35 @@ class DetuningRescaleGUI:
         grouped = {}
         for detuned, reference in self.pairs:
             grouped.setdefault(reference.group.params, []).append((detuned, reference))
-        self.comparisons = list(grouped.values())
+        # Include groups without a reference so their selection is still editable.
+        represented = {p.group.params for pairs in grouped.values() for pair in pairs for p in pair}
+        for profile in self.all_profiles:
+            if profile.group.params not in represented:
+                key = tuple((n, v) for n, v in profile.group.params if n != self.detuning_parameter)
+                grouped.setdefault(key, []).append((profile, profile))
+        eligible = set()
+        for _, profiles in _group_for_patching(self.all_profiles, tof_parameter, detuning_parameter):
+            largest = max(float(p.group.as_dict()[tof_parameter]) for p in profiles)
+            highest = [p for p in profiles if float(p.group.as_dict()[tof_parameter]) == largest]
+            if len({p.group.as_dict()[detuning_parameter] for p in highest}) > 1:
+                eligible.update(p.group.key for p in highest)
+        self.comparisons = [pairs for pairs in grouped.values()
+                            if pairs[0][0].group.key in eligible]
         self.comparison_idx = 0
         self.current_scales: Dict[Any, float] = {}
         self.scale_boxes: Dict[Any, TextBox] = {}
         self.scale_labels = []
 
         max_detunings = max((len(group) for group in self.comparisons), default=1)
-        self.fig, self.ax = plt.subplots(figsize=(12, max(8, 3 + 0.6 * max_detunings)))
-        self.fig.subplots_adjust(bottom=0.31, top=0.92, right=0.74)
+        self.fig, self.ax = plt.subplots(figsize=(17, max(8, 4 + 1.2 * max_detunings)))
+        self.fig.subplots_adjust(bottom=0.31, top=0.92, right=0.55)
         self.status_text = self.fig.text(0.06, 0.275, "", color="tab:green")
         self.ax.set_xscale("log")
         self.ax.set_yscale("log")
         self.ax.set_xlabel("k")
         self.ax.set_ylabel("nk")
 
-        self.fig.text(0.78, 0.94, "Scale factors (Enter to preview)", fontsize=9)
+        self.fig.text(0.58, 0.94, "Detunings — scale: Enter to preview, Confirm to save", fontsize=9)
         self.btn_confirm = Button(self.fig.add_axes([0.25, 0.17, 0.18, 0.055]), "Confirm")
         self.btn_prev = Button(self.fig.add_axes([0.46, 0.17, 0.10, 0.055]), "Previous")
         self.btn_next = Button(self.fig.add_axes([0.58, 0.17, 0.10, 0.055]), "Next")
@@ -1119,7 +1213,7 @@ class DetuningRescaleGUI:
 
         # initialize default axis limits
         self._default_xlim = None
-        self._default_ylim = (100.0, 1e7)
+        self._default_ylim = (100.0, 1e8)
         # persistent user-specified limits (None means not set)
         self.user_xlim: Optional[Tuple[float, float]] = None
         self.user_ylim: Optional[Tuple[float, float]] = None
@@ -1246,24 +1340,111 @@ class DetuningRescaleGUI:
         self.scale_boxes = {}
         self.scale_labels = []
         self.current_scales = {}
-        pairs = self._current_comparison()
-        spacing = min(0.09, 0.59 / len(pairs))
-        for index, (detuned, _) in enumerate(pairs):
-            detuning = detuned.group.as_dict()[self.detuning_parameter]
-            scale = self._confirmed_scale_for_detuning(detuning)
-            if scale is None:
-                scale = self._initial_scale_for_detuning(detuning)
-            self.current_scales[detuning] = scale
-            y = 0.85 - index * spacing
-            color = f"C{(index + 1) % 10}"
-            self.scale_labels.append(self.fig.text(
-                0.78, y + spacing * 0.5, f"{self.detuning_parameter}={detuning}",
-                color=color, fontsize=9,
-            ))
-            box = TextBox(self.fig.add_axes([0.78, y, 0.16, spacing * 0.43]),
-                          "", initial=f"{scale:.6g}")
-            box.on_submit(lambda text: self._preview_scale())
-            self.scale_boxes[detuning] = box
+        self._reset_selection_controls()
+
+    def _comparison_profiles(self):
+        profiles = {p.group.key: p for pair in self._current_comparison() for p in pair}
+        def order(profile):
+            value = profile.group.as_dict()[self.detuning_parameter]
+            try:
+                return (0, float(value))
+            except (TypeError, ValueError):
+                return (1, str(value))
+        return sorted(profiles.values(), key=order)
+
+    def _reset_selection_controls(self):
+        for widget in self.selection_widgets:
+            widget.disconnect_events()
+            widget.ax.remove()
+        self.selection_widgets = []
+        self.selection_controls = {}
+        profiles = self._comparison_profiles()
+        params = profiles[0].group.as_dict()
+        other = {n: v for n, v in params.items() if n not in (self.tof_parameter, self.detuning_parameter)}
+        largest = max(float(p.group.as_dict()[self.tof_parameter]) for p in self.all_profiles
+                      if all(p.group.as_dict()[n] == v for n, v in other.items()))
+        is_largest = float(params[self.tof_parameter]) == largest
+        spacing = min(.15, .6 / len(profiles))
+        for index, profile in enumerate(profiles):
+            key = profile.group.key
+            setting = self.selections[key]
+            y = .86 - index * spacing
+            detuning = profile.group.as_dict()[self.detuning_parameter]
+            color = f"C{index % 10}"
+            label = f"{self.detuning_parameter}={detuning}"
+            if is_largest:
+                check = CheckButtons(self.fig.add_axes([.60, y, .21, .035]),
+                                     [label], [setting["enabled"]])
+                check.labels[0].set_color(color)
+            else:
+                self.scale_labels.append(self.fig.text(.62, y + .01, label, color=color, fontsize=10))
+            if detuning != self.non_detuned_value:
+                scale = self._confirmed_scale_for_detuning(detuning)
+                if scale is None:
+                    scale = self._initial_scale_for_detuning(detuning)
+                self.current_scales[detuning] = scale
+                box = TextBox(self.fig.add_axes([.87, y, .08, .035]),
+                              "Scale ", initial=f"{scale:.6g}")
+                box.on_submit(lambda text: self._preview_scale())
+                self.scale_boxes[detuning] = box
+            if not is_largest:
+                continue
+            bounds = _default_detuning_selections([profile])[key]
+            lo = min(bounds["k_min"], setting["k_min"])
+            hi = max(bounds["k_max"], setting["k_max"])
+            slider = RangeSlider(self.fig.add_axes([.63, y-.033, .32, .018]), "",
+                                 np.log10(lo), np.log10(hi if hi > lo else lo * 1.01),
+                                 valinit=np.log10([setting["k_min"], setting["k_max"]]), valfmt="")
+            slider.valtext.set_visible(False)
+            low = TextBox(self.fig.add_axes([.66, y-.076, .10, .028]), "k min ", initial=f'{setting["k_min"]:.12g}')
+            high = TextBox(self.fig.add_axes([.85, y-.076, .10, .028]), "k max ", initial=f'{setting["k_max"]:.12g}')
+            def toggle(_, key=key, check=check):
+                self.selections[key]["enabled"] = bool(check.get_status()[0])
+                self._refresh_plot(keep_preview=True)
+            def update_range(a, b, key=key, low=low, high=high):
+                self.selections[key].update(k_min=float(a), k_max=float(b))
+                for box, value in ((low, a), (high, b)):
+                    box.eventson = False
+                    box.set_val(f"{value:.12g}")
+                    box.eventson = True
+                self._refresh_plot(keep_preview=True)
+
+            def slide(values, key=key, bounds=bounds, update=update_range):
+                # A logarithmic round-trip can move an untouched endpoint just
+                # inside the data. Preserve it exactly; snap slider extremes to
+                # the original data bounds so endpoint samples remain inclusive.
+                endpoints = []
+                for log_value, name in zip(values, ("k_min", "k_max")):
+                    value = float(10 ** log_value)
+                    for candidate in (self.selections[key][name], bounds[name]):
+                        if log_value == np.log10(candidate):
+                            value = candidate
+                            break
+                    endpoints.append(value)
+                update(*endpoints)
+
+            def submit(text, endpoint, key=key, slider=slider, update=update_range):
+                try:
+                    a = float(text) if endpoint == "k_min" else self.selections[key]["k_min"]
+                    b = float(text) if endpoint == "k_max" else self.selections[key]["k_max"]
+                    if not np.isfinite([a, b]).all() or not 0 < a <= b:
+                        raise ValueError
+                    slider.ax.set_xlim(min(slider.valmin, np.log10(a)), max(slider.valmax, np.log10(b)))
+                    slider.valmin = min(slider.valmin, np.log10(a))
+                    slider.valmax = max(slider.valmax, np.log10(b))
+                    slider.eventson = False
+                    slider.set_val(np.log10([a, b]))
+                    slider.eventson = True
+                    update(a, b)
+                except ValueError:
+                    self.status_text.set_text("k ranges must be finite, positive and ordered.")
+                    self.fig.canvas.draw_idle()
+            check.on_clicked(toggle)
+            slider.on_changed(slide)
+            low.on_submit(lambda text, submit=submit: submit(text, "k_min"))
+            high.on_submit(lambda text, submit=submit: submit(text, "k_max"))
+            self.selection_widgets.extend([check, slider, low, high])
+            self.selection_controls[key] = (check, slider, low, high)
 
     def _refresh_plot(self, keep_preview: bool = False) -> None:
         self.ax.clear()
@@ -1272,7 +1453,7 @@ class DetuningRescaleGUI:
         self.ax.set_xlabel("k")
         self.ax.set_ylabel("nk")
 
-        if not self.pairs:
+        if not self.comparisons:
             self.ax.text(0.5, 0.5, "No detuned/reference pairs found.", ha="center", va="center")
             self.fig.canvas.draw_idle()
             return
@@ -1282,29 +1463,26 @@ class DetuningRescaleGUI:
         if not keep_preview:
             self._reset_scale_controls()
 
-        reference_label = "Non-detuned reference"
-        if not reference.included_in_final:
-            reference_label += " (excluded from final)"
-        self.ax.loglog(reference.k, reference.nk, "o-", ms=3,
-                       label=reference_label, color="C0")
-        if reference.stderr is not None:
-            self.ax.fill_between(reference.k, reference.nk - reference.stderr,
-                                 reference.nk + reference.stderr, color="C0", alpha=0.15)
-        for index, (detuned, _) in enumerate(pairs):
-            detuning = detuned.group.as_dict()[self.detuning_parameter]
-            scale = self.current_scales[detuning]
-            scaled_nk = detuned.nk * scale
-            color = f"C{(index + 1) % 10}"
-            label = f"{self.detuning_parameter}={detuning} (×{scale:.6g})"
-            if not detuned.included_in_final:
-                label += " (excluded from final)"
-            self.ax.loglog(detuned.k, scaled_nk, "o-", ms=3, label=label, color=color)
-            if detuned.stderr is not None:
-                scaled_err = detuned.stderr * scale
-                self.ax.fill_between(detuned.k, scaled_nk - scaled_err,
-                                     scaled_nk + scaled_err, color=color, alpha=0.2)
+        profiles = self._comparison_profiles()
+        for index, profile in enumerate(profiles):
+            detuning = profile.group.as_dict()[self.detuning_parameter]
+            scale = self.current_scales.get(detuning, 1.0)
+            color = f"C{index % 10}"
+            label = f"{self.detuning_parameter}={detuning}"
+            label += " (reference)" if detuning == self.non_detuned_value else f" (×{scale:.6g})"
+            mask = np.ones(profile.k.shape, dtype=bool)
+            if profile.group.key in self.selection_controls:
+                setting = self.selections[profile.group.key]
+                mask &= (profile.k >= setting["k_min"]) & (profile.k <= setting["k_max"])
+                if not setting["enabled"]:
+                    continue
+            k = profile.k[mask]
+            nk = profile.nk[mask] * scale
+            self.ax.loglog(k, nk, "o-", ms=3, label=label, color=color)
+            if profile.stderr is not None:
+                err = profile.stderr[mask] * scale
+                self.ax.fill_between(k, nk - err, nk + err, color=color, alpha=.2)
 
-        profiles = [reference] + [pair[0] for pair in pairs]
         self._default_xlim = (min(np.nanmin(profile.k) for profile in profiles),
                               max(np.nanmax(profile.k) for profile in profiles))
 
@@ -1333,7 +1511,8 @@ class DetuningRescaleGUI:
         title = ", ".join(f"{k}={v}" for k, v in reference.group.params
                           if k != self.detuning_parameter)
         self.ax.set_title(f"Comparison {self.comparison_idx + 1}/{len(self.comparisons)} | {title}")
-        self.ax.legend(loc="best")
+        if self.ax.lines:
+            self.ax.legend(loc="best")
         self.fig.canvas.draw_idle()
 
     def _preview_scale(self) -> bool:
@@ -1383,7 +1562,8 @@ class DetuningRescaleGUI:
             payload = _load_json_file(path, "detuning rescale factors")
             if not isinstance(payload, dict):
                 raise ValueError("Scale-factor JSON must contain a mapping of detunings to factors.")
-            loaded = {str(detuning): float(factor) for detuning, factor in payload.items()}
+            loaded, selections = _read_detuning_settings(payload)
+            self.selections.update({k: v for k, v in selections.items() if k in self.selections})
             if any(not np.isfinite(factor) or factor <= 0 for factor in loaded.values()):
                 raise ValueError("Scale factors must be finite, positive numbers.")
 
@@ -1437,15 +1617,9 @@ class DetuningRescaleGUI:
             elif (confirmed_scale := self._confirmed_scale_for_detuning(detuning_value)) is not None:
                 factor = confirmed_scale
             else:
-                matching = [
-                    pair
-                    for pair in self.pairs
-                    if pair[0].group.as_dict().get(self.detuning_parameter) == detuning_value
-                ]
-                if matching:
-                    factor = float(self._estimate_initial_scale(matching[0][0], matching[0][1]))
-                else:
-                    factor = 1.0
+                # Use the same default shown in every comparison. Estimating
+                # from only the first pair silently changes the scale on save.
+                factor = self._initial_scale_for_detuning(detuning_value)
             factors[detuning_value] = factor
         return factors
 
@@ -1453,7 +1627,8 @@ class DetuningRescaleGUI:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         factors = self._detuning_scale_factors()
         outpath = self.output_dir / "detuning_rescale_factors.json"
-        json_payload = {str(detuning): factor for detuning, factor in factors.items()}
+        json_payload = {"version": 2, "scale_factors": {str(d): f for d, f in factors.items()},
+                        "selections": self.selections}
         outpath.write_text(json.dumps(json_payload, indent=2))
         return outpath, factors
 
@@ -1471,7 +1646,10 @@ class DetuningRescaleGUI:
         plt.close(self.fig)
 
     def launch(self) -> Dict[Any, float]:
-        plt.show()
+        if self.comparisons:
+            plt.show()
+        else:
+            plt.close(self.fig)
         if self.stop_pipeline:
             raise SystemExit("Pipeline stopped by user.")
         if self.save_on_close:
@@ -2358,20 +2536,11 @@ class MomentumDistributionPipeline:
                 if "waittime" in self.run_parameters.variable_names
                 else sort_parameter or "waittime"
             )
-        # Rescaling needs a reference even when it is excluded from final patches.
-        # The first interval to start defines the reference (mapping order breaks ties).
-        reference_intervals = list(self.detuning_activation_times.items())
-        for rule in self.detuning_activation_conditions:
-            reference_intervals.extend(rule["activation_times"].items())
-        reference_detuning = (
-            min(reference_intervals, key=lambda item: item[1][0])[0]
-            if reference_intervals
-            else self.groups[0].as_dict().get(self.detuning_parameter)
-        )
-        self.non_detuned_value = next(
-            (group.as_dict().get(self.detuning_parameter) for group in self.groups
-             if self._detunings_match(group.as_dict().get(self.detuning_parameter), reference_detuning)),
-            reference_detuning,
+        # The largest numerical detuning is always the non-detuned reference,
+        # independent of acquisition order and activation intervals.
+        self.non_detuned_value = max(
+            (group.as_dict()[self.detuning_parameter] for group in self.groups),
+            key=float,
         )
         # Retained for callers that inspect the pipeline state.  All groups are
         # shown and processed; this list identifies groups used in final patches.
@@ -2387,6 +2556,7 @@ class MomentumDistributionPipeline:
         self.detuning_rescale_factors_json = detuning_rescale_factors_json
         self.patch_validity_ranges_json = patch_validity_ranges_json
         self.detuning_scale_factors: Optional[Dict[str, float]] = None
+        self.detuning_selections = {}
 
         if blanks_json is not None:
             blanks_payload = _load_json_file(blanks_json, "blanks")
@@ -2401,10 +2571,7 @@ class MomentumDistributionPipeline:
             )
             if not isinstance(factors_payload, dict):
                 raise ValueError("Detuning-rescale JSON must contain a mapping of detuning values to scale factors.")
-            self.detuning_scale_factors = {
-                str(detuning): float(factor)
-                for detuning, factor in factors_payload.items()
-            }
+            self.detuning_scale_factors, self.detuning_selections = _read_detuning_settings(factors_payload)
 
         if patch_validity_ranges_json is not None:
             ranges_payload = _load_json_file(patch_validity_ranges_json, "patch validity ranges")
@@ -2653,8 +2820,10 @@ class MomentumDistributionPipeline:
                 non_detuned_value=self.non_detuned_value,
                 output_dir=self.output_directory,
                 sort_parameter=self.sort_parameter,
+                tof_parameter=self.tof_parameter,
             )
             detuning_scale_factors: Dict[Any, float] = rescale_gui.launch()
+            self.detuning_selections = rescale_gui.selections
         else:
             detuning_scale_factors = self.detuning_scale_factors
 
@@ -2683,8 +2852,13 @@ class MomentumDistributionPipeline:
             )
             rescaled_profiles.append(scaled_profile)
 
-        self.rescaled_profiles = rescaled_profiles
-        return rescaled_profiles
+        selections = _default_detuning_selections(rescaled_profiles)
+        selections.update({k: v for k, v in self.detuning_selections.items() if k in selections})
+        self.detuning_selections = selections
+        self.rescaled_profiles = _combine_largest_tof(
+            rescaled_profiles, selections, self.tof_parameter,
+            self.detuning_parameter, self.non_detuned_value)
+        return self.rescaled_profiles
 
     def select_patch_validity_ranges(self) -> Dict[str, Tuple[float, float]]:
         if not self.rescaled_profiles:

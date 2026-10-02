@@ -58,6 +58,10 @@ pipeline = run_full_pipeline(
 )
 ```
 
+At the largest TOF, activation rules now supply initial GUI selections only;
+the rescaling GUI and saved selections determine the actual inclusion and k ranges.
+At lower TOFs, activation rules continue to apply directly.
+
 `detuning_activation_times` optionally maps **every detuning to use**, including
 non-detuned data, to a `(tmin, tmax)` interval. A profile contributes when
 `tmin <= time < tmax`. Use `float("-inf")` or `float("inf")` for open-ended
@@ -71,9 +75,8 @@ contribute.
 
 The time parameter defaults to `"waittime"` when available (otherwise
 `sort_parameter`); override it with `activation_time_parameter`.
-The detuning with the earliest interval start is the rescaling reference
-(mapping order breaks ties). Without intervals, the first group's detuning is
-the reference. There is no separate `non_detuned_value` argument. Include the
+The largest numerical detuning is always the non-detuned rescaling reference,
+regardless of acquisition order or activation intervals. There is no separate `non_detuned_value` argument. Include the
 reference in the acquired data so other detunings can be compared against it.
 
 To use different intervals for different experimental settings, add conditional
@@ -96,13 +99,13 @@ with `detuning_activation_times`. Unmatched groups use `detuning_activation_time
 if that is omitted or empty, they are unrestricted. An empty rule dictionary
 (`"activation_times": {}`) also leaves matching groups unrestricted.
 The non-detuned fallback for TOFs without matching detuned data still applies.
-Rescaling continues to use one shared reference: the earliest interval start
-across the default dictionary and all rules (default first, then rule order
-breaks ties).
+Rescaling continues to use one shared reference: the largest numerical
+detuning among the retained parameter groups.
 
-All data remain visible in the bad-image, rescaling, and validity-range GUIs;
-series excluded from the final result are labelled accordingly. Averaged profile
-files are retained for every parameter combination.
+All acquired groups remain visible in the bad-image and rescaling GUIs.
+The validity-range GUI receives only the combined largest-TOF distribution
+for each parameter set. Averaged profile files are retained for every parameter
+combination.
 
 ### Combining acquisitions from multiple runs
 
@@ -206,9 +209,9 @@ After completion, `output_directory` will contain:
 - `patch_validity_ranges.json`
 - `final_profiles/`
 
-Rescaled profiles are retained in memory for patching but are not saved separately:
-they are fully reproducible by applying `detuning_rescale_factors.json` to the
-matching files in `averaged_profiles/`.
+Rescaled profiles are retained in memory for patching but are not saved separately.
+Re-running from the original shots with `detuning_rescale_factors.json` restores
+the scales, selections and combined distributions.
 
 Final profiles use the lowest TOF with valid data in each k range to set the
 bin centres. Starting with the lowest TOF's valid positive k values, each
@@ -349,14 +352,30 @@ saving and ends the current Python run before the next stage starts.
 
 ### Detuning rescaling
 
-- Enter a trial factor in **Scale factor** to preview it. **Save scale & next**
-  records that factor for the current detuning and advances to the next pair.
-- **Previous** / **Next** switch comparison pairs. The x/y limit boxes and
-  **Apply limits** control the view; **Reset limits** restores automatic axes.
-- **Load JSON** imports `detuning_rescale_factors.json` values for matching
-  detunings.
+- Enter trial factors to preview all detunings together. **Confirm** records
+  the displayed factors without advancing. Factors remain shared across all
+  parameter sets and TOFs; **Previous** / **Next** switch comparisons.
+- Only parameter sets with multiple detunings at their largest TOF appear
+  in the rescaling GUI; lower TOFs and single-detuning sets are skipped.
+  Each detuning (including the reference) has a **Use** checkbox and a logarithmic k-range slider with numeric
+  endpoints. These choices are independent for every parameter set. Existing
+  activation rules initialize the checkboxes; GUI choices override them.
+  Switched-off detunings are hidden. Enabled curves and their error bands are
+  displayed only within their selected inclusive k-ranges.
+- **Save and close** saves confirmed factors and the current selections in
+  `detuning_rescale_factors.json` (`scale_factors` and `selections`, version 2).
+  **Load JSON** restores both; legacy factor-only files remain supported.
+- Selected detunings are combined into one largest-TOF profile, weighted by
+  contributing shot counts. Ranges are inclusive. Disabled detunings and samples
+  outside their ranges do not contribute. If all are disabled, that TOF is omitted.
+  Individual shots remain available internally for final binning and standard errors.
+- The x/y limit boxes and **Apply limits** control the view;
+  **Reset limits** restores the full k extent and default y-limits of 10²–10⁸.
 
 ### Patch ranges
+
+The largest TOF displays only the combined distribution. Its patch-range key
+uses the reference detuning for compatibility with existing range files.
 
 - The top buttons select the active `(ToF, detuning, ...)` configuration. Any
   non-swept experimental parameters (for example `ZeroaV`) are included, so a
