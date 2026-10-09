@@ -2827,6 +2827,7 @@ class MomentumDistributionPipeline:
         else:
             detuning_scale_factors = self.detuning_scale_factors
 
+        self.detuning_scale_factors = dict(detuning_scale_factors)
         rescaled_profiles: List[AveragedProfile] = []
         for profile in self.averaged_profiles:
             detuning_value = profile.group.as_dict().get(self.detuning_parameter)
@@ -2880,6 +2881,47 @@ class MomentumDistributionPipeline:
         self.patch_ranges = gui.launch()
         return self.patch_ranges
 
+    def write_n0s(self) -> Path:
+        """Export each non-blank shot's rescaled occupation at its lowest k.
+
+        Keep full acquisition parameter groups, before detuning combination or
+        final patching. Combined acquisitions use the IDs in shot_sources.json.
+        """
+        if self.detuning_scale_factors is None:
+            raise ValueError("Rescale detuned images before writing n0s.")
+        output_dir = self.output_directory / "n0s"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        manifest = []
+        for profile in self.averaged_profiles:
+            detuning = profile.group.as_dict().get(self.detuning_parameter)
+            factor = float(self.detuning_scale_factors.get(
+                detuning, self.detuning_scale_factors.get(str(detuning), 1.0)
+            ))
+            relative_path = Path(f"n0_{profile.group.key or 'all_params'}.csv")
+            path = output_dir / relative_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", newline="") as file:
+                writer = csv.writer(file)
+                writer.writerow(["image_number", "n0"])
+                for number in profile.run_numbers:
+                    shot = self.image_processing[number]
+                    k = _ensure_numeric_array(shot["k"]).reshape(-1)
+                    nk = _ensure_numeric_array(shot["nk"]).reshape(-1)
+                    if k.size != nk.size:
+                        raise ValueError(f"Mismatched k/nk lengths for image {number}.")
+                    indices = np.flatnonzero(np.isfinite(k))
+                    # Do not substitute a higher-k value if the lowest-k nk
+                    # is missing; retain NaN so the image can be investigated.
+                    n0 = nk[indices[np.argmin(k[indices])]] * factor if indices.size else np.nan
+                    writer.writerow([number, n0])
+            manifest.append({
+                "group": profile.group.as_dict(),
+                "file": relative_path.as_posix(),
+                "scale_factor": factor,
+            })
+        (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+        return output_dir
+
     def patch_tofs_and_detunings(self) -> Path:
         if not self.rescaled_profiles:
             raise ValueError("No rescaled profiles. Run rescale_detuned_images() first.")
@@ -2918,6 +2960,7 @@ class MomentumDistributionPipeline:
             )
 
         (final_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+        self.write_n0s()
         return final_dir
 
 

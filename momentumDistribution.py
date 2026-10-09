@@ -82,6 +82,83 @@ class MomentumDistribution:
             energy_err = np.sqrt((energy_err / N) ** 2 + (energy * Nerr / N**2) ** 2)
         return energy, energy_err
 
+    def nth_moment(
+        self, n: int, m: int = 0, k_max: Optional[float] = None
+    ) -> Tuple[float, float]:
+        """Return the normalized nth radial momentum moment and its uncertainty.
+
+        Evaluate ``integral k**(n+2)*nk dk / integral k**(m+2)*nk dk`` with
+        the trapezoidal rule (the common 4*pi factor cancels). ``n`` must
+        be a non-negative integer. Both integrals start at the smallest
+        finite, non-negative sampled k, including zero when available,
+        and end at ``k_max`` or the last available sample, whichever is
+        smaller. With ``k_max=None``, use the full measured range.
+
+        A cutoff between samples uses linearly interpolated nk, so the
+        first sample above the cutoff contributes to that endpoint only.
+        No extrapolation is performed. Non-finite k/nk pairs are omitted;
+        negative nk values are retained. The normalization must be positive.
+        The moment has units of k**n; the zeroth moment is (1.0, 0.0).
+
+        First-order uncertainty propagation assumes independent original
+        nk errors and includes covariance from interpolation and shared
+        normalization. Errors of contributing samples must be finite and
+        non-negative. Stored data are unchanged.
+        """
+        if isinstance(n, (bool, np.bool_)) or not isinstance(n, (int, np.integer)) or n < 0:
+            raise ValueError("n must be a non-negative integer.")
+        n = int(n)
+        if k_max is not None and (not np.isfinite(k_max) or k_max <= 0):
+            raise ValueError("k_max must be a positive finite value.")
+
+        valid = np.isfinite(self.k) & np.isfinite(self.nk) & (self.k >= 0)
+        order = np.argsort(self.k[valid])
+        source_k = self.k[valid][order]
+        source_nk = self.nk[valid][order]
+        source_err = self.nkerr[valid][order]
+        if source_k.size < 2:
+            raise ValueError("At least two finite, non-negative-k points are required for a moment.")
+        if np.any(np.diff(source_k) == 0):
+            raise ValueError("Momentum values must be unique for a moment.")
+        upper = source_k[-1] if k_max is None else min(k_max, source_k[-1])
+        if upper <= source_k[0]:
+            raise ValueError("The moment integration range must have positive width.")
+        k = source_k[source_k <= upper]
+        if k[-1] < upper:
+            k = np.append(k, upper)
+
+        # Map integration weights back to the original measured samples so
+        # an interpolated endpoint does not introduce independent noise.
+        right = np.clip(np.searchsorted(source_k, k, side="right"), 1, source_k.size - 1)
+        left = right - 1
+        fraction = (k - source_k[left]) / (source_k[right] - source_k[left])
+        trapezoid_weights = np.zeros_like(k)
+        trapezoid_weights[:-1] += np.diff(k) / 2.0
+        trapezoid_weights[1:] += np.diff(k) / 2.0
+
+        def source_weights(power):
+            weights = trapezoid_weights * np.power(k, power)
+            result = np.zeros_like(source_k)
+            np.add.at(result, left, weights * (1.0 - fraction))
+            np.add.at(result, right, weights * fraction)
+            return result
+
+        denominator_weights = source_weights(m + 2)
+        numerator_weights = source_weights(n + 2)
+        used = (denominator_weights != 0) | (numerator_weights != 0)
+        errors = source_err[used]
+        if np.any(~np.isfinite(errors)) or np.any(errors < 0):
+            raise ValueError("Moment requires finite, non-negative nk errors for contributing samples.")
+        normalization = denominator_weights @ source_nk
+        if not np.isfinite(normalization) or normalization <= 0:
+            raise ValueError("Moment requires a positive finite normalization.")
+        value = float((numerator_weights @ source_nk) / normalization)
+        if not np.isfinite(value):
+            raise ValueError("Moment is not finite; check n and the momentum range.")
+        gradient = (numerator_weights[used] - value * denominator_weights[used]) / normalization
+        error = float(np.sqrt(np.sum(np.square(gradient * errors))))
+        return value, error
+
     def inner_product(
         self,
         other: "MomentumDistribution",

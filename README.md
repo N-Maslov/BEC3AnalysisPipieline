@@ -208,6 +208,18 @@ After completion, `output_directory` will contain:
 - `detuning_rescale_factors.json`
 - `patch_validity_ranges.json`
 - `final_profiles/`
+- `n0s/n0_<full parameter set>.csv`
+
+The final stage also writes one `n0_<full parameter set>.csv` per full parameter combination
+(including ToF and detuning), with columns `image_number,n0`. Each row is one
+non-blank image's nk at its smallest finite k, multiplied by that detuning's
+rescale factor. Values are taken before averaging, detuning combination, or
+patching; patch validity ranges and activation selections do not trim these
+diagnostic files. Excluded parameter combinations are omitted. Zero k is
+included when present. Missing nk at the lowest k, or no finite k, produces
+`nan` rather than substituting a higher-k measurement. In combined-run mode,
+image numbers are the unique pipeline IDs mapped by `shot_sources.json`.
+`n0s/manifest.json` lists the current files, parameters, and rescale factors.
 
 Rescaled profiles are retained in memory for patching but are not saved separately.
 Re-running from the original shots with `detuning_rescale_factors.json` restores
@@ -387,6 +399,29 @@ uses the reference detuning for compatibility with existing range files.
   data-driven defaults. **Previous set** / **Next set** switch non-TOF,
   non-detuning parameter sets.
 - **Load ranges** imports matching entries from `patch_validity_ranges.json`.
+
+## Momentum moments
+
+For a final profile CSV containing `k`, `nk`, and `stderr`:
+
+```python
+from momentumDistribution import MomentumDistribution
+
+distribution = MomentumDistribution("profile.csv")
+mean_k, mean_k_error = distribution.nth_moment(1, k_max=3.0)
+mean_k_squared, error = distribution.nth_moment(2, k_max=3.0)
+```
+
+`nth_moment(n, k_max=None)` returns the normalized 3D radial moment
+`integral k**(n+2)*nk dk / integral k**2*nk dk` and its propagated uncertainty.
+`n` must be a non-negative integer; the zeroth moment is `(1.0, 0.0)`.
+Both integrals use the same range, starting at the first finite non-negative
+sample (including zero when present). Omit `k_max` to use the full measured
+range. No extrapolation is performed; a cutoff between samples interpolates
+`nk` using the neighboring samples, including the first sample above the cutoff.
+Uncertainty includes the shared normalization and interpolation, assuming
+independent input errors. Negative `nk` values are retained, and normalization
+must be positive.
 
 ## Notes
 
