@@ -1,8 +1,9 @@
 """Post-processing helpers for final momentum-distribution profiles."""
 
 import csv
+import re
 from pathlib import Path
-from typing import Callable, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -37,6 +38,124 @@ class MomentumDistribution:
         self.n0 = nk_values[0]
         self.n0err = nkerr_values[0]
 
+    @classmethod
+    def from_mathematica_csv(cls, filepath: Union[str, Path]) -> List["MomentumDistribution"]:
+        """Load one distribution per row of a headerless Mathematica CSV.
+
+        Each quoted CSV cell must contain ``{k, Around[nk, uncertainty]}``.
+        Decimal numbers, e/E exponents, Mathematica ``*^`` exponents and
+        backtick precision/accuracy annotations are supported. Values are
+        converted to float64 without changing units, order or normalization;
+        Around uncertainties are copied to nkerr, with nan (case-insensitive)
+        replaced by zero. Negative nk is retained. Other non-finite numbers, negative uncertainties,
+        empty rows/cells and unsupported expressions raise ValueError.
+
+        Every object records the source filepath and its one-based source_row.
+        As with the ordinary constructor, n0/n0err refer to the first sample.
+        No intermediate files are written.
+        """
+        path = Path(filepath)
+        decimal = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)"
+        number = rf"{decimal}(?:`(?:`?{decimal})?)?(?:(?:\*\^|[eE])[+-]?\d+)?"
+        cell_pattern = re.compile(
+            rf"\s*\{{\s*({number})\s*,\s*Around\s*\[\s*({number})"
+            rf"\s*,\s*({number}|(?i:nan))\s*\]\s*\}}\s*"
+        )
+
+        def as_float(token):
+            token = re.sub(rf"`(?:`?{decimal})?", "", token)
+            return float(token.replace("*^", "e"))
+
+        distributions = []
+        try:
+            with path.open(newline="", encoding="utf-8-sig") as source:
+                reader = csv.reader(source, strict=True)
+                for row_number, row in enumerate(reader, start=1):
+                    if not row:
+                        raise ValueError(f"{path}: row {row_number} is empty.")
+                    samples = []
+                    for column_number, cell in enumerate(row, start=1):
+                        location = f"{path}: row {row_number}, column {column_number}"
+                        match = cell_pattern.fullmatch(cell)
+                        if match is None:
+                            raise ValueError(
+                                f"{location}: expected {{k, Around[nk, uncertainty]}}; got {cell!r}."
+                            )
+                        sample = tuple(as_float(token) for token in match.groups())
+                        if np.isnan(sample[2]):
+                            sample = (sample[0], sample[1], 0.0)
+                        if not all(np.isfinite(value) for value in sample):
+                            raise ValueError(f"{location}: all numbers must be finite.")
+                        if sample[2] < 0:
+                            raise ValueError(f"{location}: uncertainty must be non-negative.")
+                        samples.append(sample)
+                    distribution = cls.__new__(cls)
+                    distribution.filepath = path
+                    distribution.source_row = row_number
+                    distribution.k, distribution.nk, distribution.nkerr = (
+                        np.array(values, dtype=float) for values in zip(*samples)
+                    )
+                    distribution.n0 = float(distribution.nk[0])
+                    distribution.n0err = float(distribution.nkerr[0])
+                    distributions.append(distribution)
+        except OSError as exc:
+            raise ValueError(f"Could not read Mathematica CSV '{path}': {exc}") from exc
+        except csv.Error as exc:
+            raise ValueError(f"{path}: invalid CSV near line {reader.line_num}: {exc}") from exc
+        if not distributions:
+            raise ValueError(f"{path}: no distributions found.")
+        return distributions
+
+    def interpolate(self, k: float) -> Tuple[float, float]:
+        """Return linearly interpolated ``nk`` and a heuristic error at ``k``.
+
+        Between neighbouring samples, the error is
+        ``hypot((nk_right - nk_left)/2, (err_left + err_right)/2)``.
+        This combines local variation and the average measured error; it is
+        not a statistically propagated standard error. At an exact sampled
+        momentum (including either endpoint), return its measured nk/error.
+        Inputs and outputs use the same units as the stored data.
+
+        Non-finite k/nk pairs are omitted, and the remaining samples are
+        sorted without changing stored data. No extrapolation is allowed.
+        Duplicate momenta and non-finite or negative contributing errors
+        raise ValueError. ``k`` must be a finite scalar.
+        """
+        if not np.isscalar(k) or isinstance(k, (str, bytes, complex)):
+            raise ValueError("k must be a finite scalar.")
+        k = float(k)
+        if not np.isfinite(k):
+            raise ValueError("k must be a finite scalar.")
+
+        valid = np.isfinite(self.k) & np.isfinite(self.nk)
+        order = np.argsort(self.k[valid])
+        source_k = self.k[valid][order]
+        source_nk = self.nk[valid][order]
+        source_err = self.nkerr[valid][order]
+        if source_k.size == 0:
+            raise ValueError("At least one finite k and nk point is required for interpolation.")
+        if np.any(np.diff(source_k) == 0):
+            raise ValueError("Momentum values must be unique for interpolation.")
+        if k < source_k[0] or k > source_k[-1]:
+            raise ValueError(f"k must lie within [{source_k[0]}, {source_k[-1]}].")
+
+        right = np.searchsorted(source_k, k)
+        exact = source_k[right] == k
+        errors = source_err[right:right + 1] if exact else source_err[right - 1:right + 1]
+        if np.any(~np.isfinite(errors)) or np.any(errors < 0):
+            raise ValueError("Interpolation requires finite, non-negative nk errors for contributing samples.")
+        if exact:
+            return float(source_nk[right]), float(source_err[right])
+
+        left = right - 1
+        fraction = (k - source_k[left]) / (source_k[right] - source_k[left])
+        value = (1.0 - fraction) * source_nk[left] + fraction * source_nk[right]
+        error = np.hypot(
+            source_nk[right] / 2.0 - source_nk[left] / 2.0,
+            source_err[left] / 2.0 + source_err[right] / 2.0,
+        )
+        return float(value), float(error)
+
     def total_atom_number(
         self, k_cutoff: Optional[float] = None, k_lower_bound: Optional[float] = None
     ) -> Tuple[float, float]:
@@ -55,6 +174,62 @@ class MomentumDistribution:
             k_cutoff=k_cutoff,
             k_lower_bound=k_lower_bound,
         )
+
+    def k_for_atom_number(self, atom_number: float) -> float:
+        """Return the first k whose integrated ``4*pi*k**2*nk`` is atom_number.
+
+        Use the same trapezoidal integral and linearly interpolated nk at
+        the cutoff as :meth:`total_atom_number`. Integration starts at the
+        smallest finite, positive sampled k; no extrapolation to zero or
+        beyond the measured range is performed. A zero target returns that
+        first k. Non-finite k/nk pairs are omitted and stored data are unchanged.
+
+        Negative nk samples are retained. If the cumulative integral crosses
+        the target more than once, return the smallest k. Raise ValueError
+        for an unreachable target, invalid data, or a target that is not a
+        finite, non-negative scalar. The result has the units of stored k;
+        no uncertainty is estimated.
+        """
+        if (not np.isscalar(atom_number)
+                or isinstance(atom_number, (str, bytes, complex, bool, np.bool_))):
+            raise ValueError("atom_number must be a finite, non-negative scalar.")
+        atom_number = float(atom_number)
+        if not np.isfinite(atom_number) or atom_number < 0:
+            raise ValueError("atom_number must be a finite, non-negative scalar.")
+
+        valid = np.isfinite(self.k) & np.isfinite(self.nk) & (self.k > 0)
+        order = np.argsort(self.k[valid])
+        k, nk = self.k[valid][order], self.nk[valid][order]
+        if k.size < 2:
+            raise ValueError("At least two finite, positive-k points are required for integration.")
+        if np.any(np.diff(k) == 0):
+            raise ValueError("Momentum values must be unique for integration.")
+        if atom_number == 0:
+            return float(k[0])
+
+        polynomial = np.polynomial.Polynomial
+        cumulative = 0.0
+        for left in range(k.size - 1):
+            width = k[left + 1] - k[left]
+            # Express the partial trapezoid in the interval fraction t.
+            # Its endpoint is k_left + width*t, with linearly interpolated nk.
+            endpoint = polynomial([k[left], width])**2 * polynomial(
+                [nk[left], nk[left + 1] - nk[left]]
+            )
+            area = 2.0 * np.pi * width * polynomial([0.0, 1.0]) * (
+                k[left]**2 * nk[left] + endpoint
+            )
+            residual = area + (cumulative - atom_number)
+            if not np.all(np.isfinite(residual.coef)):
+                raise ValueError("Integral is not finite; check the momentum range and nk values.")
+            roots = residual.roots()
+            candidates = [float(np.clip(root.real, 0.0, 1.0)) for root in roots
+                          if abs(root.imag) <= 1e-10 and -1e-12 <= root.real <= 1 + 1e-12]
+            if candidates:
+                return float(k[left] + width * min(candidates))
+            cumulative += float(area(1.0))
+
+        raise ValueError("atom_number is not reached within the measured momentum range.")
 
     def total_energy(
         self,
@@ -98,12 +273,15 @@ class MomentumDistribution:
         first sample above the cutoff contributes to that endpoint only.
         No extrapolation is performed. Non-finite k/nk pairs are omitted;
         negative nk values are retained. The normalization must be positive.
-        The moment has units of k**n; the zeroth moment is (1.0, 0.0).
+        ``m`` selects the denominator power; its default of zero gives the
+        normalized nth radial moment. The ratio has units of k**(n-m).
+        When n == m, the result is (1.0, 0.0), provided the inputs and
+        normalization are valid.
 
         First-order uncertainty propagation assumes independent original
         nk errors and includes covariance from interpolation and shared
-        normalization. Errors of contributing samples must be finite and
-        non-negative. Stored data are unchanged.
+        normalization, treating k values as exact. Errors of contributing
+        samples must be finite and non-negative. Stored data are unchanged.
         """
         if isinstance(n, (bool, np.bool_)) or not isinstance(n, (int, np.integer)) or n < 0:
             raise ValueError("n must be a non-negative integer.")

@@ -400,6 +400,65 @@ uses the reference detuning for compatibility with existing range files.
   non-detuning parameter sets.
 - **Load ranges** imports matching entries from `patch_validity_ranges.json`.
 
+## Importing Mathematica CSV distributions
+
+For a headerless CSV with one distribution per row and quoted cells of the
+form `"{k, Around[nk, uncertainty]}"`:
+
+```python
+from momentumDistribution import MomentumDistribution
+
+distributions = MomentumDistribution.from_mathematica_csv(
+    "/Volumes/amopzh/ZH_Shared/BEC 3/Analysis/Projects/GPEB/PythonData/Set1.csv"
+)
+first = distributions[0]  # first CSV row
+print(first.k, first.nk, first.nkerr)
+atom_number, atom_number_error = first.total_atom_number()
+```
+
+This returns a list of ordinary `MomentumDistribution` objects without writing
+intermediate files. Each object retains `filepath` and a one-based `source_row`.
+Rows can have different sample counts or momentum grids. Values, units, sample
+order and negative measurements are preserved; `Around` uncertainties become
+`nkerr` directly (no conversion between standard deviation and standard error).
+`n0` and `n0err` use the first sample, as in the ordinary CSV constructor.
+Mathematica `*^` scientific notation and backtick precision annotations are
+accepted and converted to NumPy float64 values. `nan` uncertainties (in any
+letter case) are replaced by zero, including `n0err` for the first sample.
+Unsupported cells, other non-finite
+values and negative uncertainties report their row and column; empty rows and
+files are rejected rather than silently shifting row indices.
+
+## Interpolating a momentum distribution
+
+```python
+from momentumDistribution import MomentumDistribution
+
+distribution = MomentumDistribution("profile.csv")
+nk, nk_error = distribution.interpolate(1.25)
+```
+
+`interpolate(k)` linearly interpolates between the neighbouring finite samples.
+Its heuristic error estimate is
+`sqrt(((nk_right - nk_left)/2)**2 + ((err_left + err_right)/2)**2)`.
+At an exact sampled momentum, including the endpoints, it returns the measured
+value and original error bar. Values outside the finite sampled range raise
+`ValueError`; no extrapolation is performed. The error estimate combines local
+variation and measured uncertainty, rather than being a propagated standard error.
+
+## Momentum cutoff for an atom number
+
+```python
+k = distribution.k_for_atom_number(10_000)
+```
+
+Returns the first momentum where the cumulative integral of `4*pi*k**2*nk`
+equals the requested atom number, using the same trapezoidal rule and cutoff
+interpolation as `total_atom_number`. Integration starts at the smallest
+positive measured momentum, without extrapolation to zero. A zero target
+returns that starting momentum. Invalid or unreachable targets raise
+`ValueError`. The result is a scalar momentum without an uncertainty estimate.
+
 ## Momentum moments
 
 For a final profile CSV containing `k`, `nk`, and `stderr`:
@@ -412,16 +471,18 @@ mean_k, mean_k_error = distribution.nth_moment(1, k_max=3.0)
 mean_k_squared, error = distribution.nth_moment(2, k_max=3.0)
 ```
 
-`nth_moment(n, k_max=None)` returns the normalized 3D radial moment
-`integral k**(n+2)*nk dk / integral k**2*nk dk` and its propagated uncertainty.
-`n` must be a non-negative integer; the zeroth moment is `(1.0, 0.0)`.
+`nth_moment(n, m=0, k_max=None)` returns the ratio
+`integral k**(n+2)*nk dk / integral k**(m+2)*nk dk` and its propagated uncertainty.
+The default `m=0` gives the normalized nth 3D radial moment. The ratio has
+units of `k**(n-m)`. `n` must be a non-negative integer; when `n == m`, the
+result is `(1.0, 0.0)`, provided the inputs and normalization are valid.
 Both integrals use the same range, starting at the first finite non-negative
 sample (including zero when present). Omit `k_max` to use the full measured
 range. No extrapolation is performed; a cutoff between samples interpolates
 `nk` using the neighboring samples, including the first sample above the cutoff.
 Uncertainty includes the shared normalization and interpolation, assuming
-independent input errors. Negative `nk` values are retained, and normalization
-must be positive.
+independent `nk` errors and treating `k` values as exact. Negative `nk` values
+are retained, and normalization must be positive.
 
 ## Notes
 
