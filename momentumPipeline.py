@@ -18,6 +18,13 @@ from imageProcessing import ImageProcessing
 from runParameters import RunParameters
 
 
+def _in_k_range(k: np.ndarray, low: float, high: float) -> np.ndarray:
+    """Inclusive bounds with tolerance only for floating-point round trips."""
+    return ((k >= low) | np.isclose(k, low, rtol=1e-12, atol=0.0)) & (
+        (k <= high) | np.isclose(k, high, rtol=1e-12, atol=0.0)
+    )
+
+
 @dataclass(frozen=True)
 class PipelineRun:
     """One independently scheduled acquisition contributing to a pipeline."""
@@ -1899,10 +1906,25 @@ class PatchRangesGUI:
 
     def _update_slider_value_labels(self) -> None:
         """Show physical k values while the slider positions use log10(k)."""
-        if self.slider_min is not None:
-            self.k_min_box.set_val(f"{10 ** self.slider_min.val:.6g}")
-        if self.slider_max is not None:
-            self.k_max_box.set_val(f"{10 ** self.slider_max.val:.6g}")
+        for slider, box in ((self.slider_min, self.k_min_box),
+                            (self.slider_max, self.k_max_box)):
+            if slider is not None:
+                # TextBox.set_val emits submit events, just like user input.
+                # A rounded display must never feed back into the cutoff.
+                events = box.eventson
+                box.eventson = False
+                try:
+                    box.set_val(f"{self._slider_k_value(slider):.6g}")
+                finally:
+                    box.eventson = events
+
+    def _slider_k_value(self, slider: Slider) -> float:
+        low, high = self.combo_bounds[self.selected_combo]
+        if slider.val <= slider.valmin:
+            return low
+        if slider.val >= slider.valmax:
+            return high
+        return float(10 ** slider.val)
 
     def _set_k_limit_from_text(self, value_text: str, is_minimum: bool) -> None:
         if self.selected_combo == "" or self.slider_min is None or self.slider_max is None:
@@ -1912,7 +1934,7 @@ class PatchRangesGUI:
         except ValueError:
             value = float("nan")
         bound_low, bound_high = self.combo_bounds[self.selected_combo]
-        other_value = float(10 ** (self.slider_max.val if is_minimum else self.slider_min.val))
+        other_value = self._slider_k_value(self.slider_max if is_minimum else self.slider_min)
         valid_order = value <= other_value if is_minimum else value >= other_value
         if not np.isfinite(value) or not bound_low <= value <= bound_high or not valid_order:
             self.status_text.set_text(
@@ -1980,8 +2002,8 @@ class PatchRangesGUI:
     def _on_slider_change(self, _: float) -> None:
         if self.selected_combo == "" or self.slider_min is None or self.slider_max is None:
             return
-        low = float(10 ** self.slider_min.val)
-        high = float(10 ** self.slider_max.val)
+        low = self._slider_k_value(self.slider_min)
+        high = self._slider_k_value(self.slider_max)
         if low > high:
             low, high = high, low
         # Slider positions are stored as log10(k).  Converting an untouched
@@ -2195,7 +2217,7 @@ class PatchRangesGUI:
             low, high = self.validity_ranges[combo_key]
             linewidth = 2.8 if combo_key == self.selected_combo else 1.4
             zorder = 3 if combo_key == self.selected_combo else 2
-            in_valid_range = (profile.k >= low) & (profile.k <= high)
+            in_valid_range = _in_k_range(profile.k, low, high)
             if np.any(in_valid_range):
                 included_in_final = profile.included_in_final
                 label = combo_key
@@ -2381,8 +2403,7 @@ def _patch_profiles(
             np.isfinite(profile.k)
             & np.isfinite(profile.nk)
             & np.isfinite(profile.stderr)
-            & (profile.k >= k_low)
-            & (profile.k <= k_high)
+            & _in_k_range(profile.k, k_low, k_high)
             & (profile.k > 0)
             & np.isfinite(profile.n_shots_per_point)
             & (profile.n_shots_per_point > 0)
@@ -2433,7 +2454,7 @@ def _patch_profiles(
             shot_nk = np.asarray(shot_nk, dtype=float)
             valid = (
                 np.isfinite(shot_k) & np.isfinite(shot_nk)
-                & (shot_k > 0) & (shot_k >= k_low) & (shot_k <= k_high)
+                & (shot_k > 0) & _in_k_range(shot_k, k_low, k_high)
             )
             # Midpoint ties belong to the higher bin, as before.
             bin_ids = np.searchsorted(boundaries, shot_k[valid], side="right")
